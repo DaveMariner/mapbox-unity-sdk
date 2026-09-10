@@ -1,5 +1,5 @@
 using System;
-#if UNITY_EDITOR
+#if UNITY_EDITOR || UNITY_STANDALONE
 using MapboxAccountsUnity;
 #endif
 using UnityEngine;
@@ -12,7 +12,7 @@ namespace Mapbox.BaseModule.Utilities
 		public string AccessToken;
 		public bool TelemetryEnabled = true;
 		
-		#if UNITY_EDITOR
+		#if UNITY_EDITOR || UNITY_STANDALONE
 			[NonSerialized] private MapboxAccounts mapboxAccounts = new MapboxAccounts();
 
 			public void Initialize()
