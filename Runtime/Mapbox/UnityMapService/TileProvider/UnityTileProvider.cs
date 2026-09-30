@@ -204,6 +204,39 @@ namespace Mapbox.UnityMapService.TileProviders
 				}
 			}
 
+			var mapCenter = mapInformation.LatitudeLongitude;
+			var coverContainsMapCenter = false;
+			foreach (var tileId in tileCover.Tiles)
+			{
+				var expectedTileAtZoom = Conversions.LatitudeLongitudeToTileId(mapCenter, tileId.Z).Canonical;
+				if (tileId.Canonical.X == expectedTileAtZoom.X && tileId.Canonical.Y == expectedTileAtZoom.Y)
+				{
+					coverContainsMapCenter = true;
+					break;
+				}
+			}
+
+			if (!coverContainsMapCenter)
+			{
+				var centerMercator = mapInformation.CenterMercator;
+				var centerMercatorRoundTrip = Conversions.WebMercatorToLatLon(centerMercator);
+				var centerTile = Conversions.LatitudeLongitudeToTileId(mapCenter, _maxZoom);
+				var coverDescription = new List<string>(tileCover.Tiles.Count);
+				foreach (var tileId in tileCover.Tiles)
+				{
+					var canonicalTileId = tileId.Canonical;
+					var tileBounds = Conversions.TileIdToBounds(canonicalTileId);
+					coverDescription.Add($"{tileId}->canonical:{canonicalTileId},lat:{tileBounds.South:F5}..{tileBounds.North:F5},lon:{tileBounds.West:F5}..{tileBounds.East:F5}");
+				}
+
+				// var cameraParent = cam.transform.parent;
+				// var cameraRoot = cam.transform.root;
+				// var parentDescription = cameraParent == null
+				// 	? "<none>"
+				// 	: $"{cameraParent.name},worldPos:{cameraParent.position},worldRot:{cameraParent.rotation.eulerAngles},lossyScale:{cameraParent.lossyScale}";
+				// // Debug.Log($"[TILE-DIAG][provider] map center={mapCenter.Latitude:F6},{mapCenter.Longitude:F6} mercatorXY=({centerMercator.x:F2},{centerMercator.y:F2}) roundTrip={centerMercatorRoundTrip.Latitude:F6},{centerMercatorRoundTrip.Longitude:F6} scale={scale} maxZoom={_maxZoom} expectedCenterXYZ={centerTile} coverCount={tileCover.Tiles.Count} coverContainsCenter=false camera={cam.name} cameraWorldPos={camPos} cameraLocalPos={cam.transform.localPosition} cameraForward={camForward} cameraEuler={cam.transform.eulerAngles} fov={cam.fieldOfView} far={cam.farClipPlane} pixelSize={cam.pixelWidth}x{cam.pixelHeight} parent={parentDescription} root={cameraRoot.name}@{cameraRoot.position} rootRot={cameraRoot.rotation.eulerAngles} cover=[{string.Join(" | ", coverDescription)}]");
+			}
+
 			return true;
 		}
 

@@ -40,7 +40,7 @@ namespace Mapbox.UnityMapService.DataSources
                 _elevationDataExtractionStrategy = new SyncExtractElevationArray();
             }
         }
-        
+
         public override void DownloadAndCacheBaseTiles()
         {
             var backgroundTiles = new HashSet<CanonicalTileId>();
@@ -67,7 +67,7 @@ namespace Mapbox.UnityMapService.DataSources
                 BackgroundLoad(tileId, _tilesetId);
             }
         }
-        
+
         protected override RasterTile CreateTile(CanonicalTileId tileId, string tilesetId)
         {
             RasterTile rasterTile;
@@ -119,17 +119,22 @@ namespace Mapbox.UnityMapService.DataSources
         public override IEnumerator LoadTileCoroutine(CanonicalTileId requestedDataTileId, Action<TerrainData> callback = null)
         {
             TerrainData terrainData = null;
+            // Debug.Log($"[TILE-DIAG][terrain] load begin id={requestedDataTileId} cpuElevation={ExtractCpuElevationData}");
             yield return Runnable.Instance.StartCoroutine(base.LoadTileCoroutine(requestedDataTileId, (data) =>
             {
                 terrainData = data;
+                // Debug.Log($"[TILE-DIAG][terrain] raster callback id={requestedDataTileId} dataNull={data == null} texture={(data != null && data.Texture != null)} elevationReady={data != null && data.IsElevationDataReady}");
             }));
             if (terrainData != null && terrainData.Texture != null && ExtractCpuElevationData)
             {
+                // Debug.Log($"[TILE-DIAG][terrain] elevation extraction begin id={requestedDataTileId}");
                 yield return Runnable.Instance.StartCoroutine(ExtractElevationValues(terrainData));
+                // Debug.Log($"[TILE-DIAG][terrain] elevation extraction end id={requestedDataTileId} elevationReady={terrainData.IsElevationDataReady}");
             }
+            // Debug.Log($"[TILE-DIAG][terrain] load end id={requestedDataTileId} dataNull={terrainData == null} texture={(terrainData != null && terrainData.Texture != null)} elevationReady={terrainData != null && terrainData.IsElevationDataReady}");
             callback?.Invoke(terrainData);
         }
-        
+
         protected IEnumerator ExtractElevationValues(TerrainData data)
         {
             // Use the TerrainData overload (sets MinElevation/MaxElevation as part of the
@@ -150,7 +155,7 @@ namespace Mapbox.UnityMapService.DataSources
             data.ElevationValuesUpdated -= onDone;
             data.RemoveDisposeCallback(onDone);
         }
-        
+
         protected override void TextureReceivedFromFile(TerrainData cacheItem)
         {
             base.TextureReceivedFromFile(cacheItem);

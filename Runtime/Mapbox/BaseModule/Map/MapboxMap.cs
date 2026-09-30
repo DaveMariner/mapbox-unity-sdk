@@ -50,7 +50,7 @@ namespace Mapbox.BaseModule.Map
             yield return MapVisualizer.Initialize();
             MapVisualizer.TileLoaded += tile => { TileLoaded(tile); };
             MapVisualizer.TileUnloading += tile => { TileUnloading(tile); };
-            
+
             Status = InitializationStatus.Initialized;
             Initialized();
         }
@@ -60,7 +60,7 @@ namespace Mapbox.BaseModule.Map
             MapService.TileCover(MapInformation, TileCover);
             MapVisualizer.Load(TileCover);
         }
-        
+
         /// <summary>
         /// Provides a controlled method for jumping to specific locations on the map.
         /// Unlike standard frame-by-frame map updates, this method ensures precise 
@@ -81,7 +81,7 @@ namespace Mapbox.BaseModule.Map
                 callback?.Invoke();
             }));
         }
-        
+
         /// <summary>
         /// Provides a controlled method for jumping to specific locations on the map.
         /// Unlike standard frame-by-frame map updates, this method ensures precise 
@@ -103,7 +103,7 @@ namespace Mapbox.BaseModule.Map
                 callback?.Invoke();
             }));
         }
-        
+
         public IEnumerator LoadMapViewCoroutine(Action callback = null)
         {
             yield return LoadMapViewCoroutine(MapInformation.LatitudeLongitude, callback);
@@ -128,14 +128,19 @@ namespace Mapbox.BaseModule.Map
         /// </remarks>
         public IEnumerator LoadMapViewCoroutine(LatitudeLongitude targetLocation, Action callback = null)
         {
+            // Debug.Log($"[TILE-DIAG][view] begin target={targetLocation.Latitude},{targetLocation.Longitude} current={MapInformation.LatitudeLongitude.Latitude},{MapInformation.LatitudeLongitude.Longitude} zoom={MapInformation.Zoom}");
             Status = InitializationStatus.LoadingView;
             LoadViewStarting();
             MapInformation.SetLatitudeLongitude(targetLocation);
-            
+
             MapService.TileCover(MapInformation, TileCover);
+            var centerMercator = MapInformation.CenterMercator;
+            var centerTile = Conversions.LatitudeLongitudeToTileId(targetLocation, MapInformation.AbsoluteZoom);
+            var mercatorRoundTrip = Conversions.WebMercatorToLatLon(centerMercator);
+            // Debug.Log($"[TILE-DIAG][view] cover center={MapInformation.LatitudeLongitude.Latitude},{MapInformation.LatitudeLongitude.Longitude} mercatorXY=({centerMercator.x:F2},{centerMercator.y:F2}) roundTrip={mercatorRoundTrip.Latitude:F6},{mercatorRoundTrip.Longitude:F6} centerXYZ={centerTile} zoom={MapInformation.Zoom} tiles={TileCover.Tiles.Count}");
             yield return MapVisualizer.LoadTileCoverToMemory(TileCover);
             MapVisualizer.LoadSnapshot(TileCover);
-            
+
             LoadViewCompleted();
             Status = InitializationStatus.ReadyForUpdates;
             callback?.Invoke();
@@ -145,7 +150,7 @@ namespace Mapbox.BaseModule.Map
         {
             yield return MapVisualizer.LoadTileCoverToMemory(cover);
         }
-        
+
         /// <summary>
         /// Change the map core settings.
         /// If the per-frame updates are enabled, new settings will be applied next frame.
@@ -159,7 +164,7 @@ namespace Mapbox.BaseModule.Map
             MapInformation.SetInformation(latlng, zoom, pitch, bearing, scale);
             RedrawMap();
         }
-        
+
         public void OnDestroy()
         {
             MapVisualizer?.OnDestroy();
@@ -167,7 +172,7 @@ namespace Mapbox.BaseModule.Map
         }
 
         public void UpdateTileCover() => MapService.TileCover(MapInformation, TileCover);
-        
+
         /// <summary>
         /// Map redraw method, which we currently use on-demand, to recalculate the tile cover and run map visualizer on it.
         /// </summary>
@@ -176,13 +181,13 @@ namespace Mapbox.BaseModule.Map
             MapService.TileCover(mapInfo ?? MapInformation, TileCover);
             MapVisualizer.Load(TileCover);
         }
-        
-        
-        
+
+
+
         /// <summary>
         /// All modules are initialized, you can get&use any object and/or register to events safely.
         /// </summary>
-        public Action Initialized = () => {};
+        public Action Initialized = () => { };
         /// <summary>
         /// Load view procedure is starting. Status is set to InitializationStatus.LoadingView and per-frame updates
         /// are suspended until this procedure finishes.
@@ -205,4 +210,3 @@ namespace Mapbox.BaseModule.Map
         public Action<UnityMapTile> TileUnloading = (tile) => { };
     }
 }
-

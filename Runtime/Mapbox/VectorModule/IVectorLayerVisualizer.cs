@@ -24,4 +24,11 @@ namespace Mapbox.VectorModule
         void SetActive(CanonicalTileId tileId, bool isActive, IMapInformation mapInformation);
         bool ContainsVisualFor(CanonicalTileId dataTileId);
     }
+
+    /// <summary>Explicit support for retaining generated visuals independently of source data.</summary>
+    public interface IWarmVectorLayerVisualizer
+    {
+        void DeactivateWarm(CanonicalTileId tileId, IMapInformation mapInformation);
+        void ReactivateWarm(CanonicalTileId tileId, IMapInformation mapInformation);
+    }
 }

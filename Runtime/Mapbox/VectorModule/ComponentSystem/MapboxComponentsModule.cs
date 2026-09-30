@@ -23,7 +23,8 @@ namespace Mapbox.VectorModule.ComponentSystem
 
         protected override void MeshGeneration(VectorData data, Action<MeshGenerationTaskResult> callback)
         {
-            var meshTask = new MeshGenTaskWrapper<BuildingLayerTaskResult>()
+            MeshGenTaskWrapper<BuildingLayerTaskResult> meshTask = null;
+            meshTask = new MeshGenTaskWrapper<BuildingLayerTaskResult>()
             {
                 TileId = data.TileId,
                 DataAction = () =>
@@ -69,11 +70,19 @@ namespace Mapbox.VectorModule.ComponentSystem
                 DataCompleted = (task, taskResult) => //task may be null
                 {
                     if (!_isActive)
+                    {
+                        callback(new MeshGenerationTaskResult(TaskResultType.Cancelled));
                         return;
+                    }
 
-                    _activeTasks.Remove(data.TileId);
+                    if (!IsCurrentTask(data.TileId, meshTask))
+                    {
+                        callback(new MeshGenerationTaskResult(TaskResultType.Cancelled));
+                        return;
+                    }
+                    RemoveCurrentTask(data.TileId, meshTask);
 
-                    if (taskResult.ResultType == TaskResultType.Cancelled || (task != null && task.IsCanceled))
+                    if (taskResult.ResultType == TaskResultType.Cancelled || meshTask.IsCancelled || (task != null && task.IsCanceled))
                     {
                         var failResult = new MeshGenerationTaskResult(TaskResultType.Cancelled);
                         callback(failResult);

@@ -32,17 +32,17 @@ namespace Mapbox.UnityMapService.DataSources
                 CacheItemDisposed(t);
             };
         }
-        
+
         public override void LoadTile(CanonicalTileId requestedDataTileId)
         {
             LoadTileCore(requestedDataTileId);
         }
-        
+
         public override bool CheckInstantData(CanonicalTileId tileId)
         {
             return _memoryCache.Exists(tileId);
         }
-        
+
         public override bool GetInstantData(CanonicalTileId tileId, out T data)
         {
             var result = _memoryCache.Get(tileId, out data);
@@ -62,7 +62,7 @@ namespace Mapbox.UnityMapService.DataSources
                     LoadTile(id);
                 }
             }
-            
+
             _activeRequestsToCancel.Clear();
             foreach (var activeTile in _waitingList)
             {
@@ -71,7 +71,7 @@ namespace Mapbox.UnityMapService.DataSources
                     _activeRequestsToCancel.Add(activeTile.Key);
                 }
             }
-            
+
             foreach (var id in _activeRequestsToCancel)
             {
                 CancelActiveRequests(id);
@@ -81,7 +81,7 @@ namespace Mapbox.UnityMapService.DataSources
 
             return true;
         }
-        
+
         public override void CancelActiveRequests(CanonicalTileId unityTileId)
         {
             if (_waitingList.ContainsKey(unityTileId))
@@ -95,7 +95,7 @@ namespace Mapbox.UnityMapService.DataSources
                 _waitingList.Remove(unityTileId);
             }
         }
-        
+
         public override void DownloadAndCacheBaseTiles()
         {
             var backgroundTiles = new HashSet<CanonicalTileId>();
@@ -146,7 +146,7 @@ namespace Mapbox.UnityMapService.DataSources
             yield return coroutines.WaitForAll();
             _memoryCache.ClearInactive();
         }
-        
+
         public override IEnumerator ChangeTilesetId(string tilesetId)
         {
             _settings.TilesetId = tilesetId;
@@ -164,8 +164,8 @@ namespace Mapbox.UnityMapService.DataSources
             }
             _memoryCache.OnDestroy();
         }
-        
-        
+
+
 
 
         //COROUTINE METHODS only used in initialization so far
@@ -185,10 +185,12 @@ namespace Mapbox.UnityMapService.DataSources
             Action<T> callback = null)
         {
             T resultData = null;
+            // Debug.Log($"[TILE-DIAG][raster] begin id={requestedDataTileId} tileset={_tilesetId} memoryFirst={checkMemoryCacheFirst}");
 
             // STEP 1: Check memory cache if requested (LoadTileCoroutine does this, RefreshData doesn't)
             if (checkMemoryCacheFirst && GetInstantData(requestedDataTileId, out resultData))
             {
+                // Debug.Log($"[TILE-DIAG][raster] memory-cache hit id={requestedDataTileId} dataNull={resultData == null}");
                 callback?.Invoke(resultData);
                 yield break;
             }
@@ -196,22 +198,26 @@ namespace Mapbox.UnityMapService.DataSources
             // STEP 2: If already being fetched, wait for completion
             if (_waitingList.ContainsKey(requestedDataTileId))
             {
-                while(_waitingList.ContainsKey(requestedDataTileId))
+                // Debug.Log($"[TILE-DIAG][raster] joining in-flight load id={requestedDataTileId}");
+                while (_waitingList.ContainsKey(requestedDataTileId))
                 {
                     yield return null;
                 }
                 GetInstantData(requestedDataTileId, out resultData);
+                // Debug.Log($"[TILE-DIAG][raster] in-flight load ended id={requestedDataTileId} cacheLookupFound={resultData != null}");
                 callback?.Invoke(resultData);
                 yield break;
             }
 
             // STEP 3: Try file cache
             _waitingList[requestedDataTileId] = null;
+            // Debug.Log($"[TILE-DIAG][raster] file-cache lookup begin id={requestedDataTileId}");
             yield return GetImageCoroutine<T>(requestedDataTileId, _tilesetId, _settings.UseNonReadableTextures,
                 (data) =>
                 {
                     resultData = data;
                     _waitingList.Remove(requestedDataTileId);
+                    // Debug.Log($"[TILE-DIAG][raster] file-cache lookup complete id={requestedDataTileId} hit={resultData != null}");
 
                     if (resultData != null)
                     {
@@ -232,10 +238,12 @@ namespace Mapbox.UnityMapService.DataSources
                 var dataTile = CreateTile(requestedDataTileId, _tilesetId);
                 _waitingList[requestedDataTileId] = dataTile;
                 var working = true;
+                // Debug.Log($"[TILE-DIAG][raster] web fetch begin id={requestedDataTileId} tileState={dataTile.CurrentTileState}");
 
                 WebRequestData(dataTile, (fetchingResult) =>
                 {
                     _waitingList.Remove(requestedDataTileId);
+                    // Debug.Log($"[TILE-DIAG][raster] web fetch callback id={requestedDataTileId} tileState={dataTile.CurrentTileState} resultState={fetchingResult?.State} exceptions={fetchingResult?.ExceptionsAsString}");
 
                     if (dataTile.CurrentTileState == TileState.Loaded)
                     {
@@ -248,6 +256,7 @@ namespace Mapbox.UnityMapService.DataSources
                     }
 
                     working = false;
+                    // Debug.Log($"[TILE-DIAG][raster] web fetch processed id={requestedDataTileId} dataNull={resultData == null}");
                 });
 
                 while (working)
@@ -256,6 +265,7 @@ namespace Mapbox.UnityMapService.DataSources
                 }
             }
 
+            // Debug.Log($"[TILE-DIAG][raster] end id={requestedDataTileId} dataNull={resultData == null} cacheType={resultData?.CacheType.ToString() ?? "n/a"}");
             callback?.Invoke(resultData);
         }
 
@@ -278,10 +288,10 @@ namespace Mapbox.UnityMapService.DataSources
                 callback
             );
         }
-        
+
         public override IEnumerator LoadTilesCoroutine(IEnumerable<CanonicalTileId> retainedTiles, Action<List<T>> callback = null)
         {
-            if(callback != null)
+            if (callback != null)
             {
                 var results = new List<T>();
                 var coroutines = retainedTiles.Select(x => LoadTileCoroutine(x, (data) => results.Add(data)));
@@ -295,13 +305,13 @@ namespace Mapbox.UnityMapService.DataSources
             }
         }
         #endregion
-        
-        
-        
-        
+
+
+
+
         protected abstract RasterTile CreateTile(CanonicalTileId tileId, string tilesetId);
         protected abstract T CreateRasterDataWrapper(RasterTile tile);
-        
+
         private void LoadTileCore(CanonicalTileId requestedDataTileId, Action<T> callback = null)
         {
             if (IsInProgress(requestedDataTileId))
@@ -324,7 +334,7 @@ namespace Mapbox.UnityMapService.DataSources
                 else
                 {
                     _waitingList.Remove(requestedDataTileId);
-                    
+
                     var dataTile = CreateTile(requestedDataTileId, _tilesetId);
                     _waitingList[requestedDataTileId] = dataTile;
                     WebRequestData(dataTile, (fetchingResult) =>
@@ -345,7 +355,7 @@ namespace Mapbox.UnityMapService.DataSources
                 }
             });
         }
-        
+
         protected virtual void TextureReceivedFromFile(T textureCacheItem)
         {
             //var tile = (RasterTile) textureCacheItem.Tile;
@@ -415,8 +425,8 @@ namespace Mapbox.UnityMapService.DataSources
 
             return null;
         }
-        
-        
+
+
         protected void BackgroundLoad(CanonicalTileId tileId, string tilesetId)
         {
             GetImageAsync<T>(tileId, tilesetId, SystemInfo.supportsAsyncGPUReadback, (cacheItem) =>
@@ -471,11 +481,11 @@ namespace Mapbox.UnityMapService.DataSources
                     }
 
                     if (result.State == WebResponseResult.Cancelled) return;
-                    
+
                     var tile = result.Tile as RasterTile;
                     if (tile == null)
                         return;
-                    
+
                     if (tile.StatusCode == 200)
                     {
                         //Debug.Log("expired and returned 200");
@@ -497,11 +507,11 @@ namespace Mapbox.UnityMapService.DataSources
                 //Debug.Log("doesnt needs an update");
             }
         }
-        
+
         protected bool IsInProgress(CanonicalTileId requestedDataTileId)
         {
             return _waitingList.ContainsKey(requestedDataTileId) || IsActiveRequest(requestedDataTileId);
         }
     }
-    
+
 }

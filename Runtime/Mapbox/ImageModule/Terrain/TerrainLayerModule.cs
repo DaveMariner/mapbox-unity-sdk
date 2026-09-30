@@ -46,7 +46,7 @@ namespace Mapbox.ImageModule.Terrain
             if (_boundsTracker != null) return;
             _boundsTracker = new TerrainBoundsTracker(source);
         }
-        
+
         public TerrainLayerModule(Source<TerrainData> source, TerrainLayerModuleSettings settings) : base()
         {
             _settings = settings;
@@ -54,7 +54,7 @@ namespace Mapbox.ImageModule.Terrain
             _rasterSource = source;
             _terrainStrategy = new ElevatedTerrainStrategy();
         }
-        
+
         public virtual IEnumerator Initialize()
         {
             yield return _rasterSource.Initialize();
@@ -70,7 +70,7 @@ namespace Mapbox.ImageModule.Terrain
                 Debug.LogWarning($"[Mapbox] TerrainLayerModuleSettings.ExtractCpuElevationData is unchecked, but {reason}. Extraction has been force-enabled; the checkbox has no effect in this configuration.");
             }
             _terrainStrategy.Initialize(_settings.ElevationLayerProperties);
-            if(_settings.LoadBackgroundTextures)
+            if (_settings.LoadBackgroundTextures)
             {
                 _rasterSource?.DownloadAndCacheBaseTiles();
             }
@@ -136,16 +136,16 @@ namespace Mapbox.ImageModule.Terrain
             {
                 _retainedTerrainTiles.Add(GetDataId(tileId));
             }
-            
+
             isReady = _rasterSource.RetainTiles(_retainedTerrainTiles);
             return isReady;
         }
-        
+
         public void UpdatePositioning(IMapInformation mapInfo)
         {
-            
+
         }
-                
+
         public void OnDestroy()
         {
             _boundsTracker?.Dispose();
@@ -153,7 +153,7 @@ namespace Mapbox.ImageModule.Terrain
             _rasterSource.OnDestroy();
             _terrainStrategy?.OnDestroy();
         }
-        
+
         //COROUTINE METHODS only used in initialization so far
         #region coroutine methods
         public virtual IEnumerator LoadTileData(CanonicalTileId tileId, Action<TerrainData> callback = null)
@@ -175,21 +175,23 @@ namespace Mapbox.ImageModule.Terrain
         {
             // Same materialization rationale: callers iterate this lazily downstream and
             // would otherwise read a mutated _dataIdScratch after another GetDataId call.
-            var materialized = new List<CanonicalTileId>(GetDataId(tiles));
+            var inputTiles = new List<CanonicalTileId>(tiles);
+            var materialized = new List<CanonicalTileId>(GetDataId(inputTiles));
+            // Debug.Log($"[TILE-DIAG][terrain-cover] input=[{string.Join(",", inputTiles)}] dataIds=[{string.Join(",", materialized)}]");
             // Explicit lambda (not method-group): LoadTileData's optional callback
             // parameter makes the method-group conversion ambiguous between Select's
             // two overloads (Func<T,R> vs Func<T,int,R>).
             return materialized.Select(t => LoadTileData(t)).Where(x => x != null);
         }
         #endregion
-        
-        
+
+
         //PRIVATE METHODS
         private bool IsZinSupportedRange(int targetZ)
         {
             return _settings.RejectTilesOutsideZoom.x <= targetZ && _settings.RejectTilesOutsideZoom.y >= targetZ;
         }
-        
+
         private CanonicalTileId GetDataId(CanonicalTileId tileId)
         {
             var maxZoom = _settings.DataSettings.ClampDataLevelToMax;
@@ -201,13 +203,13 @@ namespace Mapbox.ImageModule.Terrain
             }
             else
             {
-                return tileId.ParentAt(targetZ);;
+                return tileId.ParentAt(targetZ); ;
             }
         }
-        
-        
+
+
         //API
-        
+
         /// <summary>
         /// This method will only search the memory cache for available data.
         /// </summary>
@@ -236,7 +238,7 @@ namespace Mapbox.ImageModule.Terrain
 
             return 0;
         }
-        
+
         /// <summary>
         /// Maps a set of render tile ids to the distinct data tile ids they sample.
         /// </summary>

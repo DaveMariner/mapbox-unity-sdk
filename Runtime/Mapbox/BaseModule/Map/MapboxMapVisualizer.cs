@@ -121,9 +121,16 @@ namespace Mapbox.BaseModule.Map
         /// <returns></returns>
         public virtual IEnumerator LoadTileCoverToMemory(TileCover tileCover)
         {
+            Debug.Log("LoadTileCoverToMemory start");
             var hashsetTiles = new HashSet<CanonicalTileId>(tileCover.Tiles.Select(x => x.Canonical));
+            // Debug.Log($"[TILE-DIAG][cover] begin canonicalTiles={hashsetTiles.Count}: {string.Join(",", hashsetTiles)}");
             var coroutines = LayerModules.SelectMany(x => x.GetTileCoverCoroutines(hashsetTiles).Where(x => x != null));
+            Debug.Log($"LoadTileCoverToMemory yield ({coroutines.Count()})");
+            Debug.Log("[TILE-DIAG][cover] waiting for layer data coroutines");
             yield return coroutines.WaitForAll();
+            Debug.Log("[TILE-DIAG][cover] all layer data coroutines returned");
+            Debug.Log("LoadTileCoverToMemory end");
+
         }
 
         public virtual void Load(TileCover tileCover)

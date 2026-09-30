@@ -19,7 +19,7 @@ namespace Mapbox.VectorModule
     }
 
     [Serializable]
-    public class VectorLayerVisualizer : IVectorLayerVisualizer
+    public class VectorLayerVisualizer : IVectorLayerVisualizer, IWarmVectorLayerVisualizer
     {
         public Dictionary<int, ModifierStack> GetModStacks => _stackList;
         public string VectorLayerName => _vectorLayerName;
@@ -106,6 +106,22 @@ namespace Mapbox.VectorModule
             {
                 UnregisterTile(canonicalTileId);
             }
+        }
+
+        public virtual void DeactivateWarm(CanonicalTileId tileId, IMapInformation mapInformation)
+        {
+            if (_results.TryGetValue(tileId, out var visuals))
+            {
+                foreach (var entity in visuals)
+                {
+                    entity.GameObject.SetActive(false);
+                }
+            }
+        }
+
+        public virtual void ReactivateWarm(CanonicalTileId tileId, IMapInformation mapInformation)
+        {
+            SetActive(tileId, true, mapInformation);
         }
         
         public bool ContainsVisualFor(CanonicalTileId dataTileId)

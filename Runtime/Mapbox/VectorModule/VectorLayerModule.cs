@@ -32,6 +32,11 @@ namespace Mapbox.VectorModule
 		private HashSet<CanonicalTileId> _retainedTiles;
 		private HashSet<CanonicalTileId> _readyTiles;
 		private List<CanonicalTileId> _tilesToRemove;
+		private readonly LinkedList<CanonicalTileId> _warmTiles = new LinkedList<CanonicalTileId>();
+		private readonly Dictionary<CanonicalTileId, LinkedListNode<CanonicalTileId>> _warmTileNodes = new Dictionary<CanonicalTileId, LinkedListNode<CanonicalTileId>>();
+		private readonly Dictionary<CanonicalTileId, object> _generationTokens = new Dictionary<CanonicalTileId, object>();
+		private readonly Dictionary<object, List<Action<MeshGenerationTaskResult>>> _generationWaiters = new Dictionary<object, List<Action<MeshGenerationTaskResult>>>();
+		private bool _warmRetentionSupported;
 		
 		public VectorLayerModule(IMapInformation mapInformation, Source<VectorData> source, UnityContext unityContext, Dictionary<string, List<IVectorLayerVisualizer>> layerVisualizers, VectorModuleSettings vectorModuleSettings = null) : base()
 		{
@@ -46,6 +51,8 @@ namespace Mapbox.VectorModule
 			}
 			
 			_vectorModuleSettings = vectorModuleSettings ?? new VectorModuleSettings();
+			_warmRetentionSupported = _vectorModuleSettings.WarmVisualTileCapacity > 0 &&
+				_layerVisualizers.Values.SelectMany(x => x).All(x => x is IWarmVectorLayerVisualizer);
 			_readyTiles = new HashSet<CanonicalTileId>();
 			_retainedTiles = new HashSet<CanonicalTileId>();
 			_activeTasks = new Dictionary<CanonicalTileId, List<TaskWrapper>>();
@@ -77,13 +84,7 @@ namespace Mapbox.VectorModule
 			var targetId = GetTargetTileId(unityTile.CanonicalTileId);
 			if (_readyTiles.Contains(targetId))
 			{
-				foreach (var pair in _layerVisualizers)
-				{
-					foreach (var visualizer in pair.Value)
-					{
-						visualizer.SetActive(targetId, true, _mapInformation);	
-					}
-				}
+				ReactivateTile(targetId);
 				return true;
 			}
 			else
@@ -111,19 +112,20 @@ namespace Mapbox.VectorModule
 			UpdateRetainedTiles(retainedTiles);
 
 			_tilesToRemove.Clear();
-			foreach (var tileId in _readyTiles)
+			foreach (var tileId in _readyTiles.OrderBy(x => x.Z).ThenBy(x => x.X).ThenBy(x => x.Y).ToArray())
 			{
 				var isActive = _retainedTiles.Contains(tileId);
-				foreach (var pair in _layerVisualizers)
+				if (isActive)
 				{
-					foreach (var visualizer in pair.Value)
-					{
-						visualizer.SetActive(tileId, isActive, _mapInformation);	
-					}
+					ReactivateTile(tileId);
 				}
-				
-				if (!isActive)
+				else if (_warmRetentionSupported)
 				{
+					DeactivateTileWarm(tileId);
+				}
+				else
+				{
+					SetTileActive(tileId, false);
 					_tilesToRemove.Add(tileId);
 					if (_activeTasks.TryGetValue(tileId, out var tasks))
 					{
@@ -140,6 +142,7 @@ namespace Mapbox.VectorModule
 			{
 				ClearDisposedDataVisual(tileId);
 			}
+			EvictWarmTilesToCapacity();
 
 			//cancel tasks for tiles we no longer need
 			//this prevents flickers from buildings appearing in temp tiles
@@ -173,7 +176,27 @@ namespace Mapbox.VectorModule
 		
 		public virtual void OnDestroy()
 		{
+			if (!_isActive)
+			{
+				return;
+			}
 			_isActive = false;
+			if (_vectorSource != null)
+			{
+				_vectorSource.CacheItemDisposed -= ClearDisposedDataVisual;
+			}
+			foreach (var tasks in _activeTasks.Values)
+			{
+				foreach (var task in tasks)
+				{
+					task.Cancel();
+				}
+			}
+			_activeTasks.Clear();
+			_warmTiles.Clear();
+			_warmTileNodes.Clear();
+			CompleteAllGenerationWaiters(new MeshGenerationTaskResult(TaskResultType.Cancelled));
+			_generationTokens.Clear();
 			foreach (var pair in _layerVisualizers)
 			{
 				foreach (var visualizer in pair.Value)
@@ -195,6 +218,7 @@ namespace Mapbox.VectorModule
 
 		public IEnumerable<CanonicalTileId> GetReadyTiles()
 		{
+			// Ready means generated visuals; warm visuals remain ready while outside the active cover.
 			return _readyTiles;
 		}
 
@@ -352,12 +376,30 @@ namespace Mapbox.VectorModule
 			{
 				callback?.Invoke(new MeshGenerationTaskResult(TaskResultType.Success));
 			}
-			else if (!IsMeshGenInWork(vectorData.TileId))
+			else if (!_generationTokens.ContainsKey(tileId) && !IsMeshGenInWork(vectorData.TileId))
 			{
+				var generationToken = new object();
+				_generationTokens[tileId] = generationToken;
 				MeshGeneration(vectorData, (result =>
 				{
+					var isCurrentGeneration = _generationTokens.TryGetValue(tileId, out var currentToken) &&
+						ReferenceEquals(generationToken, currentToken);
+					if (isCurrentGeneration)
+					{
+						_generationTokens.Remove(tileId);
+					}
+					if (!isCurrentGeneration || !_isActive)
+					{
+						DestroyGeneratedObjects(result);
+						callback?.Invoke(new MeshGenerationTaskResult(TaskResultType.Cancelled));
+						return;
+					}
 					if (result != null)
 					{
+						if (result.ResultType == TaskResultType.Cancelled)
+						{
+							result.InvalidateAndRetry = _retainedTiles.Contains(tileId);
+						}
 						switch (result.ResultType)
 						{
 							case TaskResultType.Success:
@@ -386,34 +428,111 @@ namespace Mapbox.VectorModule
 					}
 
 					callback?.Invoke(result);;
+					CompleteGenerationWaiters(generationToken, result);
 				}));
+			}
+			else if (callback != null && _generationTokens.TryGetValue(tileId, out var generationToken))
+			{
+				if (!_generationWaiters.TryGetValue(generationToken, out var waiters))
+				{
+					waiters = new List<Action<MeshGenerationTaskResult>>();
+					_generationWaiters.Add(generationToken, waiters);
+				}
+				waiters.Add(callback);
+			}
+		}
+
+		private void CompleteGenerationWaiters(object generationToken, MeshGenerationTaskResult result)
+		{
+			if (!_generationWaiters.TryGetValue(generationToken, out var waiters))
+			{
+				return;
+			}
+			_generationWaiters.Remove(generationToken);
+			foreach (var waiter in waiters)
+			{
+				waiter(result);
+			}
+		}
+
+		private void CompleteAllGenerationWaiters(MeshGenerationTaskResult result)
+		{
+			var tokens = _generationWaiters.Keys.ToArray();
+			foreach (var token in tokens)
+			{
+				CompleteGenerationWaiters(token, result);
+			}
+		}
+
+		private static void DestroyGeneratedObjects(MeshGenerationTaskResult result)
+		{
+			if (result?.GeneratedObjects == null)
+			{
+				return;
+			}
+			foreach (var gameObject in result.GeneratedObjects)
+			{
+				if (gameObject != null)
+				{
+					gameObject.SetActive(false);
+					GameObject.Destroy(gameObject);
+				}
 			}
 		}
 
 		private IEnumerator CreateVisualCoroutine(CanonicalTileId tileId, VectorData vectorData, Action<MeshGenerationTaskResult> callback = null)
 		{
-			var isMeshGenDone = false;
-			CreateVisual(tileId, vectorData, (result) =>
+			while (true)
 			{
-				isMeshGenDone = true;
-				callback?.Invoke(result);
-			});
-			while (!isMeshGenDone)
-			{
-				yield return null;
+				var isMeshGenDone = false;
+				MeshGenerationTaskResult generationResult = null;
+				CreateVisual(tileId, vectorData, result =>
+				{
+					generationResult = result;
+					isMeshGenDone = true;
+				});
+				while (!isMeshGenDone)
+				{
+					yield return null;
+				}
+				if (generationResult != null && generationResult.InvalidateAndRetry && _isActive)
+				{
+					yield return null;
+					continue;
+				}
+				callback?.Invoke(generationResult);
+				yield break;
 			}
 		}
 
 		private void ClearDisposedDataVisual(CanonicalTileId tileId)
 		{
-			if (_activeTasks.TryGetValue(tileId, out var tasks))
+			// Source bytes can be discarded while a visual is warm: warm-capable
+			// implementations promise their generated state is independent of those bytes.
+			if (_warmRetentionSupported && _warmTileNodes.ContainsKey(tileId))
+			{
+				return;
+			}
+			if (_generationTokens.TryGetValue(tileId, out var generationToken))
+			{
+				_generationTokens.Remove(tileId);
+				CompleteGenerationWaiters(generationToken, new MeshGenerationTaskResult(TaskResultType.Cancelled));
+			}
+			RemoveWarmTile(tileId);
+			var hadReadyVisual = _readyTiles.Remove(tileId);
+			var hadTasks = _activeTasks.TryGetValue(tileId, out var tasks);
+			if (!hadReadyVisual && !hadTasks)
+			{
+				return;
+			}
+			if (hadTasks)
 			{
 				foreach (var task in tasks)
 				{
 					task.Cancel();
 				}
+				_activeTasks.Remove(tileId);
 			}
-			_readyTiles.Remove(tileId);
 			foreach (var pair in _layerVisualizers)
 			{
 				foreach (var visualizer in pair.Value)
@@ -423,6 +542,82 @@ namespace Mapbox.VectorModule
 			}
 
 			OnVectorMeshDestroyed(tileId);
+		}
+
+		protected bool IsCurrentTask(CanonicalTileId tileId, TaskWrapper task)
+		{
+			return _activeTasks.TryGetValue(tileId, out var tasks) && tasks.Contains(task);
+		}
+
+		protected void RemoveCurrentTask(CanonicalTileId tileId, TaskWrapper task)
+		{
+			if (!_activeTasks.TryGetValue(tileId, out var tasks))
+			{
+				return;
+			}
+			tasks.Remove(task);
+			if (tasks.Count == 0)
+			{
+				_activeTasks.Remove(tileId);
+			}
+		}
+
+		private void SetTileActive(CanonicalTileId tileId, bool isActive)
+		{
+			foreach (var visualizer in _layerVisualizers.Values.SelectMany(x => x))
+			{
+				visualizer.SetActive(tileId, isActive, _mapInformation);
+			}
+		}
+
+		private void DeactivateTileWarm(CanonicalTileId tileId)
+		{
+			// Repeated cover updates must not make an old entry appear recently used.
+			if (_warmTileNodes.ContainsKey(tileId))
+			{
+				return;
+			}
+			foreach (var visualizer in _layerVisualizers.Values.SelectMany(x => x))
+			{
+				((IWarmVectorLayerVisualizer)visualizer).DeactivateWarm(tileId, _mapInformation);
+			}
+			_warmTileNodes.Add(tileId, _warmTiles.AddLast(tileId));
+		}
+
+		private void ReactivateTile(CanonicalTileId tileId)
+		{
+			if (_warmRetentionSupported && _warmTileNodes.ContainsKey(tileId))
+			{
+				// Refresh the transform against current map state before any object is visible.
+				UpdateForView(tileId, _mapInformation);
+				foreach (var visualizer in _layerVisualizers.Values.SelectMany(x => x))
+				{
+					((IWarmVectorLayerVisualizer)visualizer).ReactivateWarm(tileId, _mapInformation);
+				}
+				RemoveWarmTile(tileId);
+				return;
+			}
+			SetTileActive(tileId, true);
+		}
+
+		private void RemoveWarmTile(CanonicalTileId tileId)
+		{
+			if (_warmTileNodes.TryGetValue(tileId, out var node))
+			{
+				_warmTiles.Remove(node);
+				_warmTileNodes.Remove(tileId);
+			}
+		}
+
+		private void EvictWarmTilesToCapacity()
+		{
+			var capacity = Math.Max(0, _vectorModuleSettings.WarmVisualTileCapacity);
+			while (_warmTiles.Count > capacity)
+			{
+				var oldest = _warmTiles.First.Value;
+				RemoveWarmTile(oldest);
+				ClearDisposedDataVisual(oldest);
+			}
 		}
 		
 		private bool IsMeshGenInWork(CanonicalTileId tileId) { return _activeTasks.ContainsKey(tileId); }
@@ -446,7 +641,8 @@ namespace Mapbox.VectorModule
                 return;
             }
 
-            var meshTask = new MeshGenTaskWrapper<MeshGenTaskWrapperResult>()
+            MeshGenTaskWrapper<MeshGenTaskWrapperResult> meshTask = null;
+            meshTask = new MeshGenTaskWrapper<MeshGenTaskWrapperResult>()
             {
                 TileId = data.TileId,
                 DataAction = () =>
@@ -498,11 +694,19 @@ namespace Mapbox.VectorModule
                 DataCompleted = (task, taskResult) => //task may be null
                 {
                     if (!_isActive)
+                    {
+                        callback(new MeshGenerationTaskResult(TaskResultType.Cancelled));
                         return;
-                    
-                    _activeTasks.Remove(data.TileId);
+                    }
+
+                    if (!IsCurrentTask(data.TileId, meshTask))
+                    {
+                        callback(new MeshGenerationTaskResult(TaskResultType.Cancelled));
+                        return;
+                    }
+                    RemoveCurrentTask(data.TileId, meshTask);
 					
-                    if (taskResult.ResultType == TaskResultType.Cancelled || task.IsCanceled)
+                    if (taskResult.ResultType == TaskResultType.Cancelled || meshTask.IsCancelled || (task != null && task.IsCanceled))
                     {
 	                    var failResult = new MeshGenerationTaskResult(TaskResultType.Cancelled);
 	                    callback(failResult);

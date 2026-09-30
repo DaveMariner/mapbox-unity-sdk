@@ -22,7 +22,7 @@ namespace Mapbox.UnityMapService.DataSources
         private bool _isTileJsonReady;
         private TileJSONResponse _tileJsonResponse;
         protected int[] _sourceZoomRange;
-        
+
         private readonly DataFetchingManager _dataFetchingManager;
         private readonly MapboxCacheManager _cacheManager;
         private IAsyncRequest _tileJsonRequest;
@@ -36,9 +36,9 @@ namespace Mapbox.UnityMapService.DataSources
             _dataFetchingManager = dataFetchingManager;
             _cacheManager = cacheManager;
             _activeRequests = new Dictionary<CanonicalTileId, FetchInfo>();
-            _sourceZoomRange = new[] {0, 22};
+            _sourceZoomRange = new[] { 0, 22 };
         }
-        
+
         public override IEnumerator Initialize()
         {
             while (!_isTileJsonReady)
@@ -49,17 +49,20 @@ namespace Mapbox.UnityMapService.DataSources
                     {
                         if (response == null || response.MaxZoom == 0) //failed
                         {
+                            Debug.LogWarning($"[TILE-DIAG][tilejson] tileset={_tilesetId} completed without usable metadata; responseNull={response == null}, maxZoom={response?.MaxZoom}");
                             //TODO fix this part
                             _tileJsonResponse = null;
-                            _sourceZoomRange = new[] {0, 22};
+                            _sourceZoomRange = new[] { 0, 22 };
                             _isTileJsonReady = true;
                         }
                         else
                         {
+                            // Debug.Log($"[TILE-DIAG][tilejson] tileset={_tilesetId} ready zoom={response.MinZoom}-{response.MaxZoom}");
                             _tileJsonResponse = response;
-                            _sourceZoomRange = new[] {_tileJsonResponse.MinZoom, _tileJsonResponse.MaxZoom};
+                            _sourceZoomRange = new[] { _tileJsonResponse.MinZoom, _tileJsonResponse.MaxZoom };
                             _isTileJsonReady = true;
-                        };
+                        }
+                        ;
                     });
                 }
                 yield return null;
@@ -68,22 +71,27 @@ namespace Mapbox.UnityMapService.DataSources
 
         protected void WebRequestData(Tile tile, Action<DataFetchingResult> callback) => RequestData(tile, callback, false);
         protected void WebRequestUpdate(Tile tile, Action<DataFetchingResult> callback) => RequestData(tile, callback, true);
-        
+
         private void RequestData(Tile tile, Action<DataFetchingResult> callback, bool isUpdate)
         {
             if (_activeRequests.ContainsKey(tile.Id))
+            {
+                Debug.LogWarning($"[TILE-DIAG][request] duplicate active request ignored id={tile.Id} tileset={_tilesetId} update={isUpdate}");
                 return;
-            
+            }
+
+            // Debug.Log($"[TILE-DIAG][request] enqueue id={tile.Id} tileset={_tilesetId} update={isUpdate}");
             var fetchInfo = new FetchInfo(tile, (result) =>
             {
                 _activeRequests.Remove(tile.Id);
+                // Debug.Log($"[TILE-DIAG][request] complete id={tile.Id} tileset={_tilesetId} tileState={tile.CurrentTileState} resultState={result?.State} exceptions={result?.ExceptionsAsString}");
                 callback(result);
             });
             fetchInfo.IsUpdate = isUpdate;
             _activeRequests.Add(tile.Id, fetchInfo);
             _dataFetchingManager.EnqueueForFetching(fetchInfo);
         }
-		
+
         protected void CancelFetching(Tile tile, string tilesetId)
         {
             tile.Cancel();
@@ -92,8 +100,8 @@ namespace Mapbox.UnityMapService.DataSources
             //removal through the tile.Cancel
             //no further calls are necessary
             // _dataFetchingManager.CancelFetching(tile, tilesetId);
-            
-            if(_activeTasks.TryGetValue(tile.Id, out List<TaskWrapper> taskList))
+
+            if (_activeTasks.TryGetValue(tile.Id, out List<TaskWrapper> taskList))
             {
                 foreach (var task in taskList)
                 {
@@ -112,25 +120,25 @@ namespace Mapbox.UnityMapService.DataSources
         {
             _cacheManager.SaveImage(textureCacheItem, forceInsert);
         }
-        
+
         public void RemoveData(string tilesetId, int zoom, int x, int y)
         {
             _cacheManager.RemoveData(tilesetId, zoom, x, y);
         }
-        
+
         public void GetImageAsync<T1>(CanonicalTileId tileId, string tilesetId, bool isTextureNonreadable, Action<T1> callback) where T1 : RasterData, new()
         {
             _cacheManager.GetImageAsync(tileId, tilesetId, isTextureNonreadable, callback);
         }
-        
+
         public IEnumerator GetImageCoroutine<T1>(CanonicalTileId tileId, string tilesetId, bool isTextureNonreadable, Action<T1> callback) where T1 : RasterData, new()
         {
             yield return _cacheManager.GetImageCoroutine(tileId, tilesetId, isTextureNonreadable, callback);
         }
-        
+
         public DataTaskWrapper<T1> GetTileInfoAsync<T1>(CanonicalTileId tileId, string tilesetid, int priority = 1) where T1 : MapboxTileData, new()
             => GetTileData<T1>(tileId, tilesetid, null, priority);
-        
+
         public DataTaskWrapper<T1> ReadEtagExpiration<T1>(T1 data, int priority = 1) where T1 : MapboxTileData, new()
             => GetTileData<T1>(data.TileId, data.TilesetId, data, priority);
 
@@ -149,12 +157,12 @@ namespace Mapbox.UnityMapService.DataSources
             }
             return taskWrapper;
         }
-        
+
         public IEnumerator GetTileData<T1>(CanonicalTileId tileId, string tilesetid, T1 data = null, int priority = 1, Action<T1> callback = null) where T1 : MapboxTileData, new()
         {
             yield return _cacheManager.GetBlobCoroutine<T1>(tileId, tilesetid, priority, data, callback);
         }
-        
+
         public void UpdateExpiration(CanonicalTileId tileId, string tilesetId, DateTime date)
         {
             _cacheManager.UpdateExpiration(tileId, tilesetId, date);
@@ -169,7 +177,7 @@ namespace Mapbox.UnityMapService.DataSources
         // {
         //     return z >= _sourceZoomRange[0] && z <= _sourceZoomRange[1];
         // }
-        
+
         private void TrackTask(TaskWrapper task)
         {
             if (!_activeTasks.ContainsKey(task.TileId))
@@ -178,7 +186,7 @@ namespace Mapbox.UnityMapService.DataSources
             }
             _activeTasks[task.TileId].Add(task);
         }
-        
+
         private void CompleteTask(TaskWrapper task)
         {
             if (_activeTasks.TryGetValue(task.TileId, out List<TaskWrapper> tasks))
@@ -188,9 +196,9 @@ namespace Mapbox.UnityMapService.DataSources
                     _activeTasks.Remove(task.TileId);
             }
         }
-        
+
         protected bool IsActiveRequest(CanonicalTileId tileId) => _activeTasks.ContainsKey(tileId);
-        
+
         public Action<string, CanonicalTileId> TileExpired = (tilesetid, tileId) => { };
         public Action<string, CanonicalTileId> TileUpdated = (tilesetid, tileId) => { };
     }
