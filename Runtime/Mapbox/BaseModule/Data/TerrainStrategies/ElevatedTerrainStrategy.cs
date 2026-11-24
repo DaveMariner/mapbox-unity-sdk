@@ -181,6 +181,22 @@ namespace Mapbox.ImageModule.Terrain.TerrainStrategies
 
 		public override void RegisterTile(UnityMapTile tile, bool createElevatedMesh)
 		{
+			RegisterTileInternal(tile, createElevatedMesh, null);
+		}
+
+		/// <summary>
+		/// Registers a tile and stitches shared CPU-elevation borders to already-active
+		/// same-zoom neighbors before building its collider.
+		/// </summary>
+		public void RegisterTileWithNeighbors(UnityMapTile tile, bool createElevatedMesh,
+			IReadOnlyDictionary<UnwrappedTileId, UnityMapTile> activeTiles)
+		{
+			RegisterTileInternal(tile, createElevatedMesh, activeTiles);
+		}
+
+		private void RegisterTileInternal(UnityMapTile tile, bool createElevatedMesh,
+			IReadOnlyDictionary<UnwrappedTileId, UnityMapTile> activeTiles)
+		{
 			if (_elevationOptions.unityLayerOptions.addToLayer && tile.gameObject.layer != _elevationOptions.unityLayerOptions.layerId)
 			{
 				tile.gameObject.layer = _elevationOptions.unityLayerOptions.layerId;
@@ -260,6 +276,10 @@ namespace Mapbox.ImageModule.Terrain.TerrainStrategies
 					tile.MeshFilter.sharedMesh = perTile;
 				}
 				CreateElevatedMesh(tile);
+				if (activeTiles != null)
+				{
+					StitchTileBorders(tile, activeTiles);
+				}
 			}
 
 			if (_colliderOptions != null && _colliderOptions.addCollider)
@@ -500,6 +520,8 @@ namespace Mapbox.ImageModule.Terrain.TerrainStrategies
 				PaddingY = dataWidth * scaleOffset.w,
 				Vertices = _colliderVerticesNative
 			}.Run();
+
+			CopyRenderBorderToCollider(tile, side);
 
 			mesh.Clear();
 			mesh.SetVertices(_colliderVerticesNative);
@@ -765,6 +787,157 @@ namespace Mapbox.ImageModule.Terrain.TerrainStrategies
 			// texture directly in the fragment stage, so the mesh's vertex normals are
 			// never read in either mode.
 			mesh.RecalculateBounds();
+		}
+
+		private void StitchTileBorders(UnityMapTile tile,
+			IReadOnlyDictionary<UnwrappedTileId, UnityMapTile> activeTiles)
+		{
+			var mesh = tile.MeshFilter.sharedMesh;
+			if (mesh == null || _sideVertexCount < 2 || mesh.vertexCount != _sideVertexCount * _sideVertexCount)
+			{
+				return;
+			}
+
+			var first = _useTileSkirts ? 1 : 0;
+			var last = _sideVertexCount - 1 - first;
+			var vertices = mesh.vertices;
+			var tileId = tile.UnwrappedTileId;
+
+			// Mesh rows run from the tile's south edge (row 0) to its north edge
+			// (last row). Slippy-map Y increases southward, so a northern neighbor's
+			// south edge is row 0, and the current tile's north edge is its last row.
+			var changed = false;
+			changed |= StitchNeighborBorder(tile, activeTiles, tileId.North, vertices, last, first, true);
+			changed |= StitchNeighborBorder(tile, activeTiles, tileId.South, vertices, first, last, true);
+			changed |= StitchNeighborBorder(tile, activeTiles, tileId.West, vertices, first, last, false);
+			changed |= StitchNeighborBorder(tile, activeTiles, tileId.East, vertices, last, first, false);
+
+			if (changed)
+			{
+				mesh.SetVertices(vertices);
+				mesh.RecalculateBounds();
+			}
+		}
+
+		private bool StitchNeighborBorder(UnityMapTile tile,
+			IReadOnlyDictionary<UnwrappedTileId, UnityMapTile> activeTiles,
+			UnwrappedTileId neighborId, Vector3[] currentVertices,
+			int currentEdge, int neighborEdge, bool horizontalEdge)
+		{
+			if (!activeTiles.TryGetValue(neighborId, out var neighbor) || neighbor == null ||
+				neighbor.CanonicalTileId.Z != tile.CanonicalTileId.Z)
+			{
+				return false;
+			}
+
+			var neighborMesh = neighbor.MeshFilter != null ? neighbor.MeshFilter.sharedMesh : null;
+			if (neighborMesh == null || neighborMesh.vertexCount != _sideVertexCount * _sideVertexCount)
+			{
+				return false;
+			}
+
+			var first = _useTileSkirts ? 1 : 0;
+			var count = _sideVertexCount - first * 2;
+			var neighborVertices = neighborMesh.vertices;
+			var neighborChanged = false;
+			var currentIsAuthority = IsStitchAuthority(tile, neighbor);
+			var currentChanged = false;
+			for (int i = 0; i < count; i++)
+			{
+				var along = i + first;
+				var currentIndex = horizontalEdge
+					? currentEdge * _sideVertexCount + along
+					: along * _sideVertexCount + currentEdge;
+				var neighborIndex = horizontalEdge
+					? neighborEdge * _sideVertexCount + along
+					: along * _sideVertexCount + neighborEdge;
+				// Use a stable authority so both sides agree regardless of load order.
+				var height = currentIsAuthority
+					? currentVertices[currentIndex].y
+					: neighborVertices[neighborIndex].y;
+				if (!Mathf.Approximately(currentVertices[currentIndex].y, height))
+				{
+					currentVertices[currentIndex].y = height;
+					currentChanged = true;
+				}
+				if (!Mathf.Approximately(neighborVertices[neighborIndex].y, height))
+				{
+					neighborVertices[neighborIndex].y = height;
+					neighborChanged = true;
+				}
+			}
+
+			if (neighborChanged)
+			{
+				neighborMesh.SetVertices(neighborVertices);
+				neighborMesh.RecalculateBounds();
+				RebuildColliderAfterStitch(neighbor);
+			}
+
+			return currentChanged;
+		}
+
+		private static bool IsStitchAuthority(UnityMapTile first, UnityMapTile second)
+		{
+			var firstIsFinal = first.TerrainContainer.State == TileContainerState.Final;
+			var secondIsFinal = second.TerrainContainer.State == TileContainerState.Final;
+			if (firstIsFinal != secondIsFinal)
+			{
+				return firstIsFinal;
+			}
+
+			var a = first.UnwrappedTileId;
+			var b = second.UnwrappedTileId;
+			if (a.X != b.X) return a.X < b.X;
+			return a.Y < b.Y;
+		}
+
+		private void RebuildColliderAfterStitch(UnityMapTile tile)
+		{
+			if (_colliderOptions == null || !_colliderOptions.addCollider)
+			{
+				return;
+			}
+
+			var collider = FindExistingCollider(tile);
+			if (collider != null)
+			{
+				_lastColliderBuild.Remove(collider);
+			}
+			RegisterCollider(tile);
+		}
+
+		private void CopyRenderBorderToCollider(UnityMapTile tile, int colliderSide)
+		{
+			var renderMesh = tile.MeshFilter.sharedMesh;
+			if (colliderSide < 2 || renderMesh == null ||
+				_colliderVerticesNative.Length != colliderSide * colliderSide ||
+				renderMesh.vertexCount != _sideVertexCount * _sideVertexCount)
+			{
+				return;
+			}
+
+			var border = _useTileSkirts ? 1 : 0;
+			var last = _sideVertexCount - 1 - border;
+			var interiorSide = _sideVertexCount - border * 2;
+			var renderVertices = renderMesh.vertices;
+			for (int i = 0; i < colliderSide; i++)
+			{
+				var along = border + Mathf.RoundToInt((float)i * (interiorSide - 1) / (colliderSide - 1));
+				SetColliderBorderVertex(i, 0, along, border, renderVertices, colliderSide);
+				SetColliderBorderVertex(i, colliderSide - 1, along, last, renderVertices, colliderSide);
+				SetColliderBorderVertex(0, i, border, along, renderVertices, colliderSide);
+				SetColliderBorderVertex(colliderSide - 1, i, last, along, renderVertices, colliderSide);
+			}
+		}
+
+		private void SetColliderBorderVertex(int colliderX, int colliderY, int renderX, int renderY,
+			Vector3[] renderVertices, int colliderSide)
+		{
+			var index = colliderY * colliderSide + colliderX;
+			var vertex = _colliderVerticesNative[index];
+			vertex.y = renderVertices[renderY * _sideVertexCount + renderX].y;
+			_colliderVerticesNative[index] = vertex;
 		}
 
 		#region mesh gen

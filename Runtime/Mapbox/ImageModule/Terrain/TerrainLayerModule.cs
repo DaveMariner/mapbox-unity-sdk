@@ -32,6 +32,7 @@ namespace Mapbox.ImageModule.Terrain
         // Constructed in AttachToMapVisualizer once the visualizer is available, disposed
         // in OnDestroy. The visualizer never references this directly.
         private TerrainBoundsTracker _boundsTracker;
+        private IReadOnlyDictionary<UnwrappedTileId, UnityMapTile> _activeTiles;
         // One-shot guard so QueryElevation doesn't spam the console on every call when the
         // user genuinely disabled CPU extraction.
         private bool _elevationDisabledWarningLogged;
@@ -45,6 +46,7 @@ namespace Mapbox.ImageModule.Terrain
             // Constructing a second one would leak the first (coroutine + subscriptions).
             if (_boundsTracker != null) return;
             _boundsTracker = new TerrainBoundsTracker(source);
+            _activeTiles = source.ActiveTiles;
         }
 
         public TerrainLayerModule(Source<TerrainData> source, TerrainLayerModuleSettings settings) : base()
@@ -92,7 +94,7 @@ namespace Mapbox.ImageModule.Terrain
                 if (_rasterSource.GetInstantData(parentTileId, out var instantData) && IsTileReady(instantData))
                 {
                     unityTile.TerrainContainer.SetTerrainData(instantData, _settings.UseShaderTerrain, TileContainerState.Temporary);
-                    _terrainStrategy.RegisterTile(unityTile, !_settings.UseShaderTerrain);
+                    RegisterTerrainTile(unityTile);
                     return;
                 }
             }
@@ -110,11 +112,22 @@ namespace Mapbox.ImageModule.Terrain
             if (_rasterSource.GetInstantData(targetTileId, out var instantData) && IsTileReady(instantData))
             {
                 unityTile.TerrainContainer.SetTerrainData(instantData, _settings.UseShaderTerrain, TileContainerState.Final);
-                _terrainStrategy.RegisterTile(unityTile, !_settings.UseShaderTerrain);
+                RegisterTerrainTile(unityTile);
                 return true;
             }
 
             return false;
+        }
+
+        private void RegisterTerrainTile(UnityMapTile tile)
+        {
+            if (_terrainStrategy is ElevatedTerrainStrategy elevatedStrategy && !_settings.UseShaderTerrain)
+            {
+                elevatedStrategy.RegisterTileWithNeighbors(tile, true, _activeTiles);
+                return;
+            }
+
+            _terrainStrategy.RegisterTile(tile, !_settings.UseShaderTerrain);
         }
 
         /// <summary>
