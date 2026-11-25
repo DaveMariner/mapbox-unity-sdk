@@ -32,13 +32,21 @@ namespace Mapbox.ImageModule.Terrain
         // Constructed in AttachToMapVisualizer once the visualizer is available, disposed
         // in OnDestroy. The visualizer never references this directly.
         private TerrainBoundsTracker _boundsTracker;
+        private ITileLifecycleSource _tileLifecycleSource;
         private IReadOnlyDictionary<UnwrappedTileId, UnityMapTile> _activeTiles;
+        private readonly HashSet<UnwrappedTileId> _tilesPendingRestitch = new HashSet<UnwrappedTileId>();
+        private Coroutine _restitchCoroutine;
+        private bool _destroyed;
         // One-shot guard so QueryElevation doesn't spam the console on every call when the
         // user genuinely disabled CPU extraction.
         private bool _elevationDisabledWarningLogged;
         // Reused across GetDataId(IEnumerable) calls to avoid allocating a fresh HashSet
         // plus iterator chain from Where/Select/Distinct on every tile-cover update.
         private readonly HashSet<CanonicalTileId> _dataIdScratch = new HashSet<CanonicalTileId>();
+        private Coroutine _seamReadinessCoroutine;
+        private readonly Dictionary<CanonicalTileId, TerrainData> _seamReadyData = new Dictionary<CanonicalTileId, TerrainData>();
+        private readonly Dictionary<CanonicalTileId, TerrainData> _seamReadyDataScratch = new Dictionary<CanonicalTileId, TerrainData>();
+        private readonly Dictionary<CanonicalTileId, TerrainData> _readyTerrainSampleCache = new Dictionary<CanonicalTileId, TerrainData>();
 
         public void AttachToMapVisualizer(ITileLifecycleSource source)
         {
@@ -46,7 +54,9 @@ namespace Mapbox.ImageModule.Terrain
             // Constructing a second one would leak the first (coroutine + subscriptions).
             if (_boundsTracker != null) return;
             _boundsTracker = new TerrainBoundsTracker(source);
+            _tileLifecycleSource = source;
             _activeTiles = source.ActiveTiles;
+            source.TileUnloading += OnTileUnloading;
         }
 
         public TerrainLayerModule(Source<TerrainData> source, TerrainLayerModuleSettings settings) : base()
@@ -83,9 +93,13 @@ namespace Mapbox.ImageModule.Terrain
             if (IsZinSupportedRange(unityTile.CanonicalTileId.Z) == false)
             {
                 unityTile.TerrainContainer.DisableTerrain();
+                unityTile.SetCanDisplay(true);
                 return;
             }
 
+            // A pooled tile can still hold the previous occupant's CPU mesh or shader
+            // properties. Keep it out of view until this tile ID gets valid terrain.
+            unityTile.SetCanDisplay(false);
             var targetTileId = GetDataId(unityTile.CanonicalTileId);
             var parentTileId = targetTileId;
             for (int i = parentTileId.Z; i >= 2; i--)
@@ -95,9 +109,14 @@ namespace Mapbox.ImageModule.Terrain
                 {
                     unityTile.TerrainContainer.SetTerrainData(instantData, _settings.UseShaderTerrain, TileContainerState.Temporary);
                     RegisterTerrainTile(unityTile);
+                    unityTile.SetCanDisplay(true);
                     return;
                 }
             }
+
+            // Clear the old occupant's texture/subscriptions too. The display gate above
+            // protects CPU meshes, which DisableTerrain cannot regenerate by itself.
+            unityTile.TerrainContainer.DisableTerrain();
         }
 
         public virtual bool LoadInstant(UnityMapTile unityTile)
@@ -105,6 +124,7 @@ namespace Mapbox.ImageModule.Terrain
             if (IsZinSupportedRange(unityTile.CanonicalTileId.Z) == false)
             {
                 unityTile.TerrainContainer.DisableTerrain();
+                unityTile.SetCanDisplay(true);
                 return true;
             }
 
@@ -113,6 +133,7 @@ namespace Mapbox.ImageModule.Terrain
             {
                 unityTile.TerrainContainer.SetTerrainData(instantData, _settings.UseShaderTerrain, TileContainerState.Final);
                 RegisterTerrainTile(unityTile);
+                unityTile.SetCanDisplay(true);
                 return true;
             }
 
@@ -121,6 +142,14 @@ namespace Mapbox.ImageModule.Terrain
 
         private void RegisterTerrainTile(UnityMapTile tile)
         {
+            var container = tile.TerrainContainer;
+            if (UsesCanonicalTerrainRgbSampling && container.State == TileContainerState.Final &&
+                container.TerrainData?.TileId.Z == _settings.DataSettings.ClampDataLevelToMax &&
+                TerrainRgbCanonicalSampler.IsReadyRaster(container.TerrainData))
+            {
+                container.SetCanonicalElevationSampler(SampleCanonicalTerrainRgb);
+            }
+            else container.SetCanonicalElevationSampler(null);
             if (_terrainStrategy is ElevatedTerrainStrategy elevatedStrategy && !_settings.UseShaderTerrain)
             {
                 elevatedStrategy.RegisterTileWithNeighbors(tile, true, _activeTiles);
@@ -147,10 +176,16 @@ namespace Mapbox.ImageModule.Terrain
             _retainedTerrainTiles.Clear();
             foreach (var tileId in retainedTiles)
             {
-                _retainedTerrainTiles.Add(GetDataId(tileId));
+                var dataId = GetDataId(tileId);
+                _retainedTerrainTiles.Add(dataId);
+                if (UsesCanonicalTerrainRgbSampling && dataId.Z == _settings.DataSettings.ClampDataLevelToMax)
+                    AddSeamSupport(tileId, dataId, _retainedTerrainTiles);
             }
 
             isReady = _rasterSource.RetainTiles(_retainedTerrainTiles);
+            _readyTerrainSampleCache.Clear();
+            if (UsesCanonicalTerrainRgbSampling && _seamReadinessCoroutine == null && Runnable.Instance != null)
+                _seamReadinessCoroutine = Runnable.Instance.StartCoroutine(WatchSeamDataReadiness());
             return isReady;
         }
 
@@ -161,10 +196,84 @@ namespace Mapbox.ImageModule.Terrain
 
         public void OnDestroy()
         {
+            _destroyed = true;
+            if (_tileLifecycleSource != null)
+            {
+                _tileLifecycleSource.TileUnloading -= OnTileUnloading;
+                _tileLifecycleSource = null;
+            }
+            if (_restitchCoroutine != null && Runnable.Instance != null)
+            {
+                Runnable.Instance.StopCoroutine(_restitchCoroutine);
+                _restitchCoroutine = null;
+            }
+            _tilesPendingRestitch.Clear();
+            _seamReadyData.Clear();
+            _seamReadyDataScratch.Clear();
+            _readyTerrainSampleCache.Clear();
+            if (_seamReadinessCoroutine != null && Runnable.Instance != null)
+            {
+                Runnable.Instance.StopCoroutine(_seamReadinessCoroutine);
+                _seamReadinessCoroutine = null;
+            }
             _boundsTracker?.Dispose();
             _boundsTracker = null;
             _rasterSource.OnDestroy();
             _terrainStrategy?.OnDestroy();
+        }
+
+        private void OnTileUnloading(UnityMapTile tile)
+        {
+            if (_destroyed || _settings.UseShaderTerrain || tile == null)
+            {
+                return;
+            }
+
+            var tileId = tile.UnwrappedTileId;
+            _tilesPendingRestitch.Add(tileId.North);
+            _tilesPendingRestitch.Add(tileId.South);
+            _tilesPendingRestitch.Add(tileId.East);
+            _tilesPendingRestitch.Add(tileId.West);
+            _tilesPendingRestitch.Add(tileId.NorthEast);
+            _tilesPendingRestitch.Add(tileId.NorthWest);
+            _tilesPendingRestitch.Add(tileId.SouthEast);
+            _tilesPendingRestitch.Add(tileId.SouthWest);
+
+            if (_restitchCoroutine != null)
+            {
+                return;
+            }
+
+            if (Runnable.Instance == null)
+            {
+                Debug.LogWarning("TerrainLayerModule: cannot restitch neighboring tiles after unload because Runnable.Instance is unavailable.");
+                _tilesPendingRestitch.Clear();
+                return;
+            }
+
+            _restitchCoroutine = Runnable.Instance.StartCoroutine(RestitchAfterTileUnload());
+        }
+
+        private IEnumerator RestitchAfterTileUnload()
+        {
+            // TileUnloading fires before the visualizer removes the tile from ActiveTiles.
+            // Wait one frame so all tiles in this unload batch have been removed first.
+            yield return null;
+
+            var pendingTiles = _tilesPendingRestitch.ToArray();
+            _tilesPendingRestitch.Clear();
+            if (!_destroyed && _terrainStrategy is ElevatedTerrainStrategy elevatedStrategy && _activeTiles != null)
+            {
+                foreach (var tileId in pendingTiles)
+                {
+                    if (_activeTiles.TryGetValue(tileId, out var activeTile))
+                    {
+                        elevatedStrategy.RestitchTileWithNeighbors(activeTile, _activeTiles);
+                    }
+                }
+            }
+
+            _restitchCoroutine = null;
         }
 
         //COROUTINE METHODS only used in initialization so far
@@ -207,17 +316,104 @@ namespace Mapbox.ImageModule.Terrain
 
         private CanonicalTileId GetDataId(CanonicalTileId tileId)
         {
+            return tileId.ParentAt(GetDataZoom(tileId.Z));
+        }
+
+        private int GetDataZoom(int renderZoom)
+        {
             var maxZoom = _settings.DataSettings.ClampDataLevelToMax;
-            var currentZ = tileId.Z;
-            var targetZ = (int)Mathf.Max(currentZ - 2, _settings.RejectTilesOutsideZoom.x);
-            if (targetZ >= maxZoom)
+            var targetZoom = (int)Mathf.Max(renderZoom - 2, _settings.RejectTilesOutsideZoom.x);
+            return targetZoom >= maxZoom ? maxZoom : targetZoom;
+        }
+
+        private bool UsesCanonicalTerrainRgbSampling =>
+            !_settings.UseShaderTerrain &&
+            _settings.DataSettings.TilesetId == "mapbox.terrain-rgb";
+
+        private static void AddSeamSupport(CanonicalTileId renderTile, CanonicalTileId center,
+            HashSet<CanonicalTileId> destination)
+        {
+            if (renderTile.Z < center.Z) return;
+            var worldSize = 1 << center.Z;
+            var zoomDiff = renderTile.Z - center.Z;
+            var childCount = 1 << zoomDiff;
+            // Retain support whenever this render tile covers the final source
+            // pixel band. With render zooms more than eight levels above the data
+            // grid, that band spans multiple render tiles.
+            var samplesPerChild = 256d / childCount;
+            var childX = renderTile.X % childCount;
+            var childY = renderTile.Y % childCount;
+            var needsEast = (childX + 1d) * samplesPerChild > 255d;
+            var needsSouth = (childY + 1d) * samplesPerChild > 255d;
+            if (needsEast) destination.Add(CanonicalTileId.FromUnwrappedValues(center.Z, center.X + 1, center.Y));
+            if (needsSouth && center.Y + 1 < worldSize)
+                destination.Add(CanonicalTileId.FromUnwrappedValues(center.Z, center.X, center.Y + 1));
+            if (needsEast && needsSouth && center.Y + 1 < worldSize)
+                destination.Add(CanonicalTileId.FromUnwrappedValues(center.Z, center.X + 1, center.Y + 1));
+        }
+
+        private IEnumerator WatchSeamDataReadiness()
+        {
+            while (!_destroyed)
             {
-                return tileId.ParentAt(maxZoom);
+                _seamReadyDataScratch.Clear();
+                foreach (var id in _retainedTerrainTiles)
+                {
+                    if (!_rasterSource.GetInstantData(id, out var data) || !data.IsElevationDataReady) continue;
+                    _seamReadyDataScratch[id] = data;
+                }
+                var dataSetChanged = _seamReadyDataScratch.Count != _seamReadyData.Count;
+                if (!dataSetChanged)
+                {
+                    foreach (var pair in _seamReadyDataScratch)
+                    {
+                        if (!_seamReadyData.TryGetValue(pair.Key, out var previous) || !ReferenceEquals(previous, pair.Value))
+                        {
+                            dataSetChanged = true;
+                            break;
+                        }
+                    }
+                }
+                if (dataSetChanged)
+                {
+                    _seamReadyData.Clear();
+                    _readyTerrainSampleCache.Clear();
+                    foreach (var pair in _seamReadyDataScratch) _seamReadyData[pair.Key] = pair.Value;
+                    if (_activeTiles != null && _terrainStrategy is ElevatedTerrainStrategy strategy)
+                    {
+                        foreach (var tile in _activeTiles.Values)
+                        {
+                            if (tile != null && tile.CanDisplay && tile.TerrainContainer != null &&
+                                tile.TerrainContainer.State == TileContainerState.Final)
+                                strategy.RebuildTileWithCanonicalSampling(tile, _activeTiles);
+                        }
+                    }
+                }
+                yield return new WaitForSeconds(0.25f);
             }
-            else
+            _seamReadinessCoroutine = null;
+        }
+
+        private float? SampleCanonicalTerrainRgb(CanonicalTileId renderTileId, float u, float v)
+        {
+            var dataZoom = _settings.DataSettings.ClampDataLevelToMax;
+            if (!UsesCanonicalTerrainRgbSampling || GetDataZoom(renderTileId.Z) != dataZoom ||
+                !TerrainRgbCanonicalSampler.TrySample(renderTileId, dataZoom, u, v, GetReadyTerrainData, out var height))
+                return null;
+            return height;
+        }
+
+        private TerrainData GetReadyTerrainData(CanonicalTileId id)
+        {
+            if (_readyTerrainSampleCache.TryGetValue(id, out var cached))
             {
-                return tileId.ParentAt(targetZ); ;
+                if (cached != null && cached.IsElevationDataReady && cached.ElevationValues != null) return cached;
+                _readyTerrainSampleCache.Remove(id);
             }
+            if (!_rasterSource.GetInstantData(id, out var data) || !data.IsElevationDataReady || data.ElevationValues == null)
+                return null;
+            _readyTerrainSampleCache[id] = data;
+            return data;
         }
 
 
@@ -236,6 +432,12 @@ namespace Mapbox.ImageModule.Terrain
             {
                 _elevationDisabledWarningLogged = true;
                 Debug.LogWarning("[Mapbox] QueryElevation was called but TerrainLayerModuleSettings.ExtractCpuElevationData is disabled, so no CPU elevation data exists. Returning 0 for every query. Enable ExtractCpuElevationData if anything in your scene snaps to terrain (vector features, buildings, colliders, custom elevation lookups).");
+            }
+
+            if (UsesCanonicalTerrainRgbSampling)
+            {
+                var canonicalHeight = SampleCanonicalTerrainRgb(tileId, x, y);
+                if (canonicalHeight.HasValue) return canonicalHeight.Value;
             }
 
             var originalTileId = tileId;

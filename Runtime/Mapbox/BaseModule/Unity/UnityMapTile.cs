@@ -72,6 +72,18 @@ namespace Mapbox.BaseModule.Unity
 
 		public LoadingState LoadingState;
 
+		/// <summary>
+		/// Whether this tile has geometry appropriate for its current tile ID. Terrain
+		/// modules clear this while a terrain-required tile has no usable elevation data;
+		/// flat maps and tiles outside the terrain zoom range remain displayable.
+		/// </summary>
+		public bool CanDisplay { get; private set; } = true;
+
+		public void SetCanDisplay(bool canDisplay)
+		{
+			CanDisplay = canDisplay;
+		}
+
 		public void Awake()
 		{
 			ImageContainer = new UnityTileImageContainer(this, DataDisposed);
@@ -86,6 +98,7 @@ namespace Mapbox.BaseModule.Unity
 		public void Initialize(UnwrappedTileId tileId, float scale)
 		{
 			TileScale = 1 / scale;
+			SetCanDisplay(true);
 			UnwrappedTileId = tileId;
 			CanonicalTileId = tileId.Canonical;
 #if UNITY_EDITOR

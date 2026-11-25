@@ -43,7 +43,6 @@ namespace Mapbox.ImageModule.Terrain.TerrainStrategies
 
 		private int _sideVertexCount;
 		private int _requiredVertexCount;
-
 		private TerrainColliderOptions _colliderOptions;
 
 		// Collider geometry is written by a Burst job into persistent NativeArrays so the
@@ -80,6 +79,7 @@ namespace Mapbox.ImageModule.Terrain.TerrainStrategies
 		// same data; skipping the rebuild avoids a redundant PhysX re-cook.
 		private readonly Dictionary<MeshCollider, (TerrainData data, CanonicalTileId tileId)>
 			_lastColliderBuild = new Dictionary<MeshCollider, (TerrainData, CanonicalTileId)>();
+		private readonly Dictionary<MeshCollider, int> _colliderBuildVersions = new Dictionary<MeshCollider, int>();
 
 		// Sweep dead-collider entries from _lastColliderBuild once it exceeds this count.
 		// Bounded by tile-pool peak in normal use; the sweep catches the case where
@@ -176,6 +176,7 @@ namespace Mapbox.ImageModule.Terrain.TerrainStrategies
 			if (_colliderTrianglesNative.IsCreated) _colliderTrianglesNative.Dispose();
 			if (_elevationNative.IsCreated) _elevationNative.Dispose();
 			_lastColliderBuild.Clear();
+			_colliderBuildVersions.Clear();
 			_elevationNativeMirror = null;
 		}
 
@@ -192,6 +193,57 @@ namespace Mapbox.ImageModule.Terrain.TerrainStrategies
 			IReadOnlyDictionary<UnwrappedTileId, UnityMapTile> activeTiles)
 		{
 			RegisterTileInternal(tile, createElevatedMesh, activeTiles);
+			if (tile != null && activeTiles != null && IsCanonicalTile(tile))
+			{
+				RestitchTemporaryNeighbors(tile, activeTiles);
+			}
+			else if (tile != null && activeTiles != null)
+			{
+				RestitchTileWithNeighbors(tile, activeTiles);
+			}
+		}
+
+		/// <summary>
+		/// Reconciles a CPU-elevated tile with the neighbors that remain active after a
+		/// neighboring tile has been unloaded.
+		/// </summary>
+		public void RestitchTileWithNeighbors(UnityMapTile tile,
+			IReadOnlyDictionary<UnwrappedTileId, UnityMapTile> activeTiles)
+		{
+			if (tile != null && tile.CanDisplay && !IsCanonicalTile(tile) && StitchTileBorders(tile, activeTiles))
+			{
+				RebuildColliderAfterStitch(tile);
+			}
+		}
+
+		/// <summary>
+		/// Rebuilds a final CPU terrain tile after a canonical neighboring source raster
+		/// becomes ready or leaves the retained cache. Rebuilding the full mesh matters
+		/// because interpolation taps can cross a parent boundary just inside the edge.
+		/// </summary>
+		public void RebuildTileWithCanonicalSampling(UnityMapTile tile,
+			IReadOnlyDictionary<UnwrappedTileId, UnityMapTile> activeTiles)
+		{
+			if (tile == null || !tile.CanDisplay || !IsCanonicalTile(tile) ||
+				tile.TerrainContainer.State != TileContainerState.Final || tile.MeshFilter == null ||
+				tile.MeshFilter.sharedMesh == null || tile.MeshFilter.sharedMesh == _sharedFlatMesh) return;
+
+			CreateElevatedMesh(tile);
+			RebuildColliderAfterStitch(tile);
+			if (activeTiles != null) RestitchTemporaryNeighbors(tile, activeTiles);
+		}
+
+		private void RestitchTemporaryNeighbors(UnityMapTile tile,
+			IReadOnlyDictionary<UnwrappedTileId, UnityMapTile> activeTiles)
+		{
+			var id = tile.UnwrappedTileId;
+			foreach (var neighborId in new[] { id.North, id.South, id.East, id.West,
+				id.NorthEast, id.NorthWest, id.SouthEast, id.SouthWest })
+			{
+				if (activeTiles.TryGetValue(neighborId, out var neighbor) && neighbor != null && neighbor.CanDisplay &&
+					neighbor.TerrainContainer.State == TileContainerState.Temporary && StitchTileBorders(neighbor, activeTiles))
+					RebuildColliderAfterStitch(neighbor);
+			}
 		}
 
 		private void RegisterTileInternal(UnityMapTile tile, bool createElevatedMesh,
@@ -276,7 +328,7 @@ namespace Mapbox.ImageModule.Terrain.TerrainStrategies
 					tile.MeshFilter.sharedMesh = perTile;
 				}
 				CreateElevatedMesh(tile);
-				if (activeTiles != null)
+				if (activeTiles != null && !IsCanonicalTile(tile))
 				{
 					StitchTileBorders(tile, activeTiles);
 				}
@@ -398,6 +450,7 @@ namespace Mapbox.ImageModule.Terrain.TerrainStrategies
 			for (int i = 0; i < _deadColliderKeysScratch.Count; i++)
 			{
 				_lastColliderBuild.Remove(_deadColliderKeysScratch[i]);
+				_colliderBuildVersions.Remove(_deadColliderKeysScratch[i]);
 			}
 			_deadColliderKeysScratch.Clear();
 		}
@@ -472,11 +525,15 @@ namespace Mapbox.ImageModule.Terrain.TerrainStrategies
 		private void BuildAndAssignCollider(UnityMapTile tile)
 		{
 			var meshCollider = GetOrCreateCollider(tile);
+			var buildVersion = _colliderBuildVersions.TryGetValue(meshCollider, out var previousVersion)
+				? previousVersion + 1
+				: 1;
+			_colliderBuildVersions[meshCollider] = buildVersion;
 
 			// Unity auto-populates sharedMesh on a newly added MeshCollider from the
 			// GameObject's MeshFilter.sharedMesh. We must NOT write into that mesh — it is
 			// the render mesh. Detect and allocate a dedicated collider Mesh instead.
-			var mesh = meshCollider.sharedMesh;
+			var mesh = _colliderOptions.asyncBakeCollider ? null : meshCollider.sharedMesh;
 			if (mesh == null || mesh == tile.MeshFilter.sharedMesh)
 			{
 				mesh = new Mesh { name = TerrainColliderMeshName };
@@ -515,11 +572,17 @@ namespace Mapbox.ImageModule.Terrain.TerrainStrategies
 				Side = side,
 				Size = size,
 				Scale = scale,
-				SectionWidth = dataWidth * scaleOffset.x - 1f,
-				PaddingX = dataWidth * scaleOffset.z,
-				PaddingY = dataWidth * scaleOffset.w,
+				RasterScaleX = scaleOffset.x,
+				RasterScaleY = scaleOffset.y,
+				RasterOffsetX = scaleOffset.z,
+				RasterOffsetY = scaleOffset.w,
 				Vertices = _colliderVerticesNative
 			}.Run();
+
+			// The canonical Terrain-RGB sampler may span several retained z14 rasters.
+			// Reuse it for every collider vertex so physics and the visible CPU mesh query
+			// the same source profile, including interior interpolation near a parent edge.
+			if (IsCanonicalTile(tile)) CopyCanonicalRenderSurfaceToCollider(tile, side);
 
 			CopyRenderBorderToCollider(tile, side);
 
@@ -555,7 +618,7 @@ namespace Mapbox.ImageModule.Terrain.TerrainStrategies
 					MeshId = mesh.GetInstanceID(),
 					CookingOptions = TerrainColliderCookingOptions
 				}.Schedule();
-				Runnable.Instance.StartCoroutine(CompleteBakeAndAssign(meshCollider, mesh, handle));
+				Runnable.Instance.StartCoroutine(CompleteBakeAndAssign(meshCollider, mesh, handle, buildVersion));
 			}
 			else
 			{
@@ -648,9 +711,10 @@ namespace Mapbox.ImageModule.Terrain.TerrainStrategies
 			public int Side;
 			public float Size;
 			public float Scale;
-			public float SectionWidth;
-			public float PaddingX;
-			public float PaddingY;
+			public float RasterScaleX;
+			public float RasterScaleY;
+			public float RasterOffsetX;
+			public float RasterOffsetY;
 			public NativeArray<Vector3> Vertices;
 
 			public void Execute()
@@ -661,8 +725,7 @@ namespace Mapbox.ImageModule.Terrain.TerrainStrategies
 				for (int y = 0; y < Side; y++)
 				{
 					var yrat = y * invSampleCount;
-					var sampleYf = PaddingY + yrat * SectionWidth;
-					if (sampleYf < 0f) sampleYf = 0f; else if (sampleYf > maxIndex) sampleYf = maxIndex;
+					var sampleYf = TerrainRasterCoordinates.ToSampleCoordinate(yrat, RasterScaleY, RasterOffsetY, DataWidth);
 					var y0 = (int)sampleYf;
 					var y1 = y0 + 1; if (y1 > maxIndex) y1 = maxIndex;
 					var fy = sampleYf - y0;
@@ -673,8 +736,7 @@ namespace Mapbox.ImageModule.Terrain.TerrainStrategies
 					for (int x = 0; x < Side; x++)
 					{
 						var xrat = x * invSampleCount;
-						var sampleXf = PaddingX + xrat * SectionWidth;
-						if (sampleXf < 0f) sampleXf = 0f; else if (sampleXf > maxIndex) sampleXf = maxIndex;
+						var sampleXf = TerrainRasterCoordinates.ToSampleCoordinate(xrat, RasterScaleX, RasterOffsetX, DataWidth);
 						var x0 = (int)sampleXf;
 						var x1 = x0 + 1; if (x1 > maxIndex) x1 = maxIndex;
 						var fx = sampleXf - x0;
@@ -720,7 +782,7 @@ namespace Mapbox.ImageModule.Terrain.TerrainStrategies
 		/// we destroy it once we've swapped in the new one, since each async build
 		/// allocates a fresh Mesh.
 		/// </summary>
-		private static IEnumerator CompleteBakeAndAssign(MeshCollider meshCollider, Mesh mesh, JobHandle handle)
+		private IEnumerator CompleteBakeAndAssign(MeshCollider meshCollider, Mesh mesh, JobHandle handle, int buildVersion)
 		{
 			while (!handle.IsCompleted)
 			{
@@ -737,6 +799,11 @@ namespace Mapbox.ImageModule.Terrain.TerrainStrategies
 				{
 					UnityEngine.Object.Destroy(mesh);
 				}
+				yield break;
+			}
+			if (!_colliderBuildVersions.TryGetValue(meshCollider, out var latestVersion) || latestVersion != buildVersion)
+			{
+				UnityEngine.Object.Destroy(mesh);
 				yield break;
 			}
 
@@ -759,23 +826,22 @@ namespace Mapbox.ImageModule.Terrain.TerrainStrategies
 			// Per-axis vertex count is cached from Initialize. Was previously derived via
 			// Mathf.Sqrt(mesh.vertexCount), which is exact for our square grid but wasteful
 			// and gave the local an off-axis name (it's _sideVertexCount, not sampleCount).
-			var sampleCount = _sideVertexCount;
+			var uvs = _baseMesh.Uvs;
 			for (int i = 0; i < vertices.Length; i++)
 			{
-				var x = i % sampleCount;
-				var y = i / sampleCount;
-				var dx = (float)x / (sampleCount - 2);
-				var dy = (float)y / (sampleCount - 2);
+				var x = i % _sideVertexCount;
+				var y = i / _sideVertexCount;
+				var uv = uvs[i];
 				var elevation = 0f;
 				if (!_useTileSkirts)
 				{
-					elevation = tile.TerrainContainer.QueryHeightData(dx, dy) * tile.TileScale;
+					elevation = tile.TerrainContainer.QueryHeightData(uv.x, uv.y) * tile.TileScale;
 				}
 				else
 				{
-					elevation = (x == 0 || y == 0 || x == sampleCount - 1 || y == sampleCount - 1)
+					elevation = (x == 0 || y == 0 || x == _sideVertexCount - 1 || y == _sideVertexCount - 1)
 						? -_skirtSize
-						: tile.TerrainContainer.QueryHeightData(dx, dy) * tile.TileScale;
+						: tile.TerrainContainer.QueryHeightData(uv.x, uv.y) * tile.TileScale;
 				}
 
 				vertices[i].Set(vertices[i].x, elevation, vertices[i].z);
@@ -789,14 +855,15 @@ namespace Mapbox.ImageModule.Terrain.TerrainStrategies
 			mesh.RecalculateBounds();
 		}
 
-		private void StitchTileBorders(UnityMapTile tile,
+		private bool StitchTileBorders(UnityMapTile tile,
 			IReadOnlyDictionary<UnwrappedTileId, UnityMapTile> activeTiles)
 		{
 			var mesh = tile.MeshFilter.sharedMesh;
 			if (mesh == null || _sideVertexCount < 2 || mesh.vertexCount != _sideVertexCount * _sideVertexCount)
 			{
-				return;
+				return false;
 			}
+			if (IsCanonicalTile(tile)) return false;
 
 			var first = _useTileSkirts ? 1 : 0;
 			var last = _sideVertexCount - 1 - first;
@@ -811,21 +878,40 @@ namespace Mapbox.ImageModule.Terrain.TerrainStrategies
 			changed |= StitchNeighborBorder(tile, activeTiles, tileId.South, vertices, first, last, true);
 			changed |= StitchNeighborBorder(tile, activeTiles, tileId.West, vertices, first, last, false);
 			changed |= StitchNeighborBorder(tile, activeTiles, tileId.East, vertices, last, first, false);
+			changed |= StitchCornerGroup(tile, activeTiles, vertices, last * _sideVertexCount + first,
+				tileId.North, first * _sideVertexCount + first,
+				tileId.West, last * _sideVertexCount + last,
+				tileId.NorthWest, first * _sideVertexCount + last);
+			changed |= StitchCornerGroup(tile, activeTiles, vertices, last * _sideVertexCount + last,
+				tileId.North, first * _sideVertexCount + last,
+				tileId.East, last * _sideVertexCount + first,
+				tileId.NorthEast, first * _sideVertexCount + first);
+			changed |= StitchCornerGroup(tile, activeTiles, vertices, first * _sideVertexCount + first,
+				tileId.South, last * _sideVertexCount + first,
+				tileId.West, first * _sideVertexCount + last,
+				tileId.SouthWest, last * _sideVertexCount + last);
+			changed |= StitchCornerGroup(tile, activeTiles, vertices, first * _sideVertexCount + last,
+				tileId.South, last * _sideVertexCount + last,
+				tileId.East, first * _sideVertexCount + first,
+				tileId.SouthEast, last * _sideVertexCount + first);
 
 			if (changed)
 			{
 				mesh.SetVertices(vertices);
 				mesh.RecalculateBounds();
 			}
+
+			return changed;
 		}
+
 
 		private bool StitchNeighborBorder(UnityMapTile tile,
 			IReadOnlyDictionary<UnwrappedTileId, UnityMapTile> activeTiles,
 			UnwrappedTileId neighborId, Vector3[] currentVertices,
 			int currentEdge, int neighborEdge, bool horizontalEdge)
 		{
-			if (!activeTiles.TryGetValue(neighborId, out var neighbor) || neighbor == null ||
-				neighbor.CanonicalTileId.Z != tile.CanonicalTileId.Z)
+			if (!activeTiles.TryGetValue(neighborId, out var neighbor) || neighbor == null || !neighbor.CanDisplay ||
+				neighbor.CanonicalTileId.Z != tile.CanonicalTileId.Z || IsCanonicalTile(tile))
 			{
 				return false;
 			}
@@ -840,7 +926,7 @@ namespace Mapbox.ImageModule.Terrain.TerrainStrategies
 			var count = _sideVertexCount - first * 2;
 			var neighborVertices = neighborMesh.vertices;
 			var neighborChanged = false;
-			var currentIsAuthority = IsStitchAuthority(tile, neighbor);
+			var currentIsAuthority = !IsCanonicalTile(neighbor) && IsStitchAuthority(tile, neighbor);
 			var currentChanged = false;
 			for (int i = 0; i < count; i++)
 			{
@@ -875,6 +961,84 @@ namespace Mapbox.ImageModule.Terrain.TerrainStrategies
 			}
 
 			return currentChanged;
+		}
+
+		private bool StitchCornerGroup(UnityMapTile tile,
+			IReadOnlyDictionary<UnwrappedTileId, UnityMapTile> activeTiles,
+			Vector3[] currentVertices, int currentIndex,
+			UnwrappedTileId firstId, int firstIndex,
+			UnwrappedTileId secondId, int secondIndex,
+			UnwrappedTileId diagonalId, int diagonalIndex)
+		{
+			var first = GetStitchableNeighbor(tile, activeTiles, firstId);
+			var second = GetStitchableNeighbor(tile, activeTiles, secondId);
+			var diagonal = GetStitchableNeighbor(tile, activeTiles, diagonalId);
+
+			var authorityTile = tile;
+			var authorityVertices = currentVertices;
+			var authorityIndex = currentIndex;
+			ConsiderCornerAuthority(first, firstIndex, ref authorityTile, ref authorityVertices, ref authorityIndex);
+			ConsiderCornerAuthority(second, secondIndex, ref authorityTile, ref authorityVertices, ref authorityIndex);
+			ConsiderCornerAuthority(diagonal, diagonalIndex, ref authorityTile, ref authorityVertices, ref authorityIndex);
+			var height = authorityVertices[authorityIndex].y;
+
+			var currentChanged = !Mathf.Approximately(currentVertices[currentIndex].y, height);
+			if (currentChanged)
+			{
+				currentVertices[currentIndex].y = height;
+			}
+
+			SetNeighborCornerHeight(first, firstIndex, height);
+			SetNeighborCornerHeight(second, secondIndex, height);
+			SetNeighborCornerHeight(diagonal, diagonalIndex, height);
+			return currentChanged;
+		}
+
+		private UnityMapTile GetStitchableNeighbor(UnityMapTile tile,
+			IReadOnlyDictionary<UnwrappedTileId, UnityMapTile> activeTiles,
+			UnwrappedTileId neighborId)
+		{
+			if (!activeTiles.TryGetValue(neighborId, out var neighbor) || neighbor == null || !neighbor.CanDisplay ||
+				neighbor.CanonicalTileId.Z != tile.CanonicalTileId.Z || IsCanonicalTile(tile))
+			{
+				return null;
+			}
+
+			var mesh = neighbor.MeshFilter != null ? neighbor.MeshFilter.sharedMesh : null;
+			return mesh != null && mesh.vertexCount == _sideVertexCount * _sideVertexCount ? neighbor : null;
+		}
+
+		private static void ConsiderCornerAuthority(UnityMapTile candidate, int candidateIndex,
+			ref UnityMapTile authorityTile, ref Vector3[] authorityVertices, ref int authorityIndex)
+		{
+			if (candidate == null || !IsStitchAuthority(candidate, authorityTile))
+			{
+				return;
+			}
+
+			authorityTile = candidate;
+			authorityVertices = candidate.MeshFilter.sharedMesh.vertices;
+			authorityIndex = candidateIndex;
+		}
+
+		private void SetNeighborCornerHeight(UnityMapTile tile, int vertexIndex, float height)
+		{
+			if (tile == null)
+			{
+				return;
+			}
+
+			var mesh = tile.MeshFilter.sharedMesh;
+			var vertices = mesh.vertices;
+			if (Mathf.Approximately(vertices[vertexIndex].y, height))
+			{
+				return;
+			}
+
+			vertices[vertexIndex].y = height;
+			mesh.SetVertices(vertices);
+			mesh.RecalculateBounds();
+			RebuildColliderAfterStitch(tile);
 		}
 
 		private static bool IsStitchAuthority(UnityMapTile first, UnityMapTile second)
@@ -930,6 +1094,22 @@ namespace Mapbox.ImageModule.Terrain.TerrainStrategies
 				SetColliderBorderVertex(colliderSide - 1, i, last, along, renderVertices, colliderSide);
 			}
 		}
+
+		private void CopyCanonicalRenderSurfaceToCollider(UnityMapTile tile, int colliderSide)
+		{
+			var renderMesh = tile.MeshFilter.sharedMesh;
+			if (renderMesh == null || renderMesh.vertexCount != _sideVertexCount * _sideVertexCount) return;
+			var renderVertices = renderMesh.vertices;
+			var inset = _useTileSkirts ? 1 : 0;
+			for (var y = 0; y < colliderSide; y++)
+			for (var x = 0; x < colliderSide; x++)
+			{
+				_colliderVerticesNative[y * colliderSide + x] = renderVertices[(y + inset) * _sideVertexCount + x + inset];
+			}
+		}
+
+		private static bool IsCanonicalTile(UnityMapTile tile) =>
+			tile != null && tile.TerrainContainer?.HasCanonicalElevationSampler == true;
 
 		private void SetColliderBorderVertex(int colliderX, int colliderY, int renderX, int renderY,
 			Vector3[] renderVertices, int colliderSide)

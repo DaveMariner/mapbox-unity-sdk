@@ -27,6 +27,14 @@ namespace Mapbox.BaseModule.Unity
         private UnityMapTile _unityMapTile;
         [SerializeField] public TerrainData TerrainData;
         private Vector4 _terrainTextureScaleOffset;
+        private Func<CanonicalTileId, float, float, float?> _canonicalElevationSampler;
+        internal bool HasCanonicalElevationSampler => _canonicalElevationSampler != null;
+
+        /// <summary>Optional shared source sampler used by CPU terrain and query paths.</summary>
+        public void SetCanonicalElevationSampler(Func<CanonicalTileId, float, float, float?> sampler)
+        {
+            _canonicalElevationSampler = sampler;
+        }
 
         /// <summary>
         /// Scale/offset Vector4 that maps this tile's UV [0,1] to the shared data tile's
@@ -54,6 +62,7 @@ namespace Mapbox.BaseModule.Unity
         /// <param name="state">Marks the tile container as temporary (using a parent's data while its own loads) or final.</param>
         public void SetTerrainData(TerrainData terrainData, bool useShaderElevation, TileContainerState state = TileContainerState.Final)
         {
+            _canonicalElevationSampler = null;
             // Detach from the previous TerrainData unconditionally — null-callers
             // (deliberately or accidentally clearing the slot) would otherwise leak
             // the prior subscriptions on the shared TerrainData.
@@ -121,6 +130,7 @@ namespace Mapbox.BaseModule.Unity
 
         public TerrainData GetAndClearTerrainData()
         {
+            _canonicalElevationSampler = null;
             if (TerrainData == null)
                 return null;
 
@@ -135,6 +145,8 @@ namespace Mapbox.BaseModule.Unity
         
         public float QueryHeightData(float x, float y)
         {
+            var canonical = _canonicalElevationSampler?.Invoke(_unityMapTile.CanonicalTileId, x, y);
+            if (canonical.HasValue) return canonical.Value;
             var values = TerrainData?.ElevationValues;
             if (values == null || values.Length == 0)
             {
@@ -142,9 +154,8 @@ namespace Mapbox.BaseModule.Unity
             }
 
             var width = (int)Mathf.Sqrt(values.Length);
-            var sectionWidth = width * _terrainTextureScaleOffset.x - 1f;
-            var xx = _terrainTextureScaleOffset.z * width + x * sectionWidth;
-            var yy = _terrainTextureScaleOffset.w * width + y * sectionWidth;
+            var xx = TerrainRasterCoordinates.ToSampleCoordinate(x, _terrainTextureScaleOffset.x, _terrainTextureScaleOffset.z, width);
+            var yy = TerrainRasterCoordinates.ToSampleCoordinate(y, _terrainTextureScaleOffset.y, _terrainTextureScaleOffset.w, width);
             return BilinearSampleElevation(values, width, xx, yy);
         }
 
@@ -158,9 +169,6 @@ namespace Mapbox.BaseModule.Unity
         /// </summary>
         private static float BilinearSampleElevation(float[] values, int width, float xx, float yy)
         {
-            if (xx < 0f) xx = 0f; else if (xx > width - 1) xx = width - 1;
-            if (yy < 0f) yy = 0f; else if (yy > width - 1) yy = width - 1;
-
             var x0 = (int)xx;
             var y0 = (int)yy;
             var x1 = x0 + 1; if (x1 >= width) x1 = width - 1;

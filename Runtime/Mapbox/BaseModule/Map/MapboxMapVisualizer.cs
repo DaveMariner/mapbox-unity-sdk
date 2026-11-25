@@ -394,7 +394,7 @@ namespace Mapbox.BaseModule.Map
                     var quadrant = frame.TileId.Quadrant(slot);
                     frame.NextChild++;
 
-                    if (ActiveTiles.TryGetValue(quadrant, out var unityMapTile))
+                    if (ActiveTiles.TryGetValue(quadrant, out var unityMapTile) && unityMapTile.CanDisplay)
                     {
                         _toRemove.Remove(quadrant);
                         unityMapTile.LoadingState = LoadingState.Filler;
@@ -411,8 +411,11 @@ namespace Mapbox.BaseModule.Map
                         frame.Found |= 1 << slot;
                         _delveStack[frameIdx] = frame;
                     }
-                    else if (frame.Depth > 0 && frame.TileId.Z < MaxMercatorZoom)
+                    else if (!ActiveTiles.ContainsKey(quadrant) && frame.Depth > 0 && frame.TileId.Z < MaxMercatorZoom)
                     {
+                        // A hidden tile is not coverage. Do not descend through an
+                        // existing hidden parent: it may own children that will be
+                        // pooled with it during normal tile-cover removal.
                         // Save the advanced NextChild before pushing the child frame —
                         // we'll resume this slot's evaluation after the child finishes.
                         _delveStack[frameIdx] = frame;
@@ -442,8 +445,21 @@ namespace Mapbox.BaseModule.Map
                             if ((frame.Found & (1 << i)) == 0)
                             {
                                 var q = frame.TileId.Quadrant(i);
+                                // Preserve an existing hidden tile instead of overwriting
+                                // it with a second filler for the same dictionary key.
+                                if (ActiveTiles.ContainsKey(q))
+                                {
+                                    continue;
+                                }
                                 CreateTempTile(q, out var unityMapTile);
                                 unityMapTile.LoadingState = LoadingState.Filler;
+                                if (!unityMapTile.CanDisplay)
+                                {
+                                    unityMapTile.Recycle();
+                                    unityMapTile.LoadingState = LoadingState.None;
+                                    _tileCreator.PutTile(unityMapTile);
+                                    continue;
+                                }
                                 ActiveTiles[q] = unityMapTile;
                                 ShowTile(unityMapTile);
                                 activeChildren.Add(unityMapTile);
@@ -473,8 +489,10 @@ namespace Mapbox.BaseModule.Map
 
         protected void ShowTile(UnityMapTile unityTile)
         {
-            unityTile.gameObject.SetActive(true);
             _mapInformation.PositionObjectFor(unityTile.gameObject, unityTile.CanonicalTileId);
+            // Position hidden terrain tiles as well so a later valid load or tile-cover
+            // update can show them at the current map transform without stale placement.
+            unityTile.gameObject.SetActive(unityTile.CanDisplay);
         }
 
         protected void PoolTile(UnityMapTile tile)

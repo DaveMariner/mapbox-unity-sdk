@@ -101,8 +101,7 @@ namespace Mapbox.BaseModule.Data.DataFetchers
         public float QueryHeightData(Vector2 point)
         {
             // Mirror the 3-arg overload's guard: shader-only mode (ExtractCpuElevationData=false)
-            // leaves ElevationValues null and _cachedWidth=0 — ReadElevation would index a
-            // null array with sectionWidth=-1 and NRE.
+            // leaves ElevationValues null and _cachedWidth=0.
             if (!(ElevationValues?.Length > 0)) return 0;
             return ReadElevation(point.x, point.y, new Vector4(1, 1, 0, 0));
         }
@@ -116,16 +115,12 @@ namespace Mapbox.BaseModule.Data.DataFetchers
         private float ReadElevation(float x, float y, Vector4 terrainTextureScaleOffset)
         {
             var width = _cachedWidth;
-            var sectionWidth = width * terrainTextureScaleOffset.x - 1f;
-            var xx = terrainTextureScaleOffset.z * width + Mathf.Clamp01(x) * sectionWidth;
-            var yy = terrainTextureScaleOffset.w * width + Mathf.Clamp01(y) * sectionWidth;
+            var xx = TerrainRasterCoordinates.ToSampleCoordinate(Mathf.Clamp01(x), terrainTextureScaleOffset.x, terrainTextureScaleOffset.z, width);
+            var yy = TerrainRasterCoordinates.ToSampleCoordinate(Mathf.Clamp01(y), terrainTextureScaleOffset.y, terrainTextureScaleOffset.w, width);
 
             // Bilinear sample — when the caller's UV resolution is finer than the data
             // texture's sub-region (typical for render tiles sharing one data tile with 15
             // neighbors), nearest-neighbor sampling produces visible stepping.
-            if (xx < 0f) xx = 0f; else if (xx > width - 1) xx = width - 1;
-            if (yy < 0f) yy = 0f; else if (yy > width - 1) yy = width - 1;
-
             var x0 = (int)xx;
             var y0 = (int)yy;
             var x1 = x0 + 1; if (x1 >= width) x1 = width - 1;
