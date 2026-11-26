@@ -1,5 +1,6 @@
 using System;
 using System.Collections;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using Mapbox.BaseModule.Data.DataFetchers;
@@ -46,7 +47,12 @@ namespace Mapbox.ImageModule.Terrain
         private Coroutine _seamReadinessCoroutine;
         private readonly Dictionary<CanonicalTileId, TerrainData> _seamReadyData = new Dictionary<CanonicalTileId, TerrainData>();
         private readonly Dictionary<CanonicalTileId, TerrainData> _seamReadyDataScratch = new Dictionary<CanonicalTileId, TerrainData>();
-        private readonly Dictionary<CanonicalTileId, TerrainData> _readyTerrainSampleCache = new Dictionary<CanonicalTileId, TerrainData>();
+        // Read and written from both the main thread (elevated mesh build during tile
+        // registration) and TaskManager worker threads (vector mesh-gen snapping calls
+        // QueryElevation off-thread), so this cache must tolerate concurrent access.
+        // A plain Dictionary corrupted under concurrent insert/remove during map load
+        // (InvalidOperationException from Dictionary.FindEntry).
+        private readonly ConcurrentDictionary<CanonicalTileId, TerrainData> _readyTerrainSampleCache = new ConcurrentDictionary<CanonicalTileId, TerrainData>();
 
         public void AttachToMapVisualizer(ITileLifecycleSource source)
         {
@@ -408,7 +414,9 @@ namespace Mapbox.ImageModule.Terrain
             if (_readyTerrainSampleCache.TryGetValue(id, out var cached))
             {
                 if (cached != null && cached.IsElevationDataReady && cached.ElevationValues != null) return cached;
-                _readyTerrainSampleCache.Remove(id);
+                // ConcurrentDictionary has no Remove; TryRemove racing with another
+                // thread's reinsert is benign — both insert equivalent data for the id.
+                _readyTerrainSampleCache.TryRemove(id, out _);
             }
             if (!_rasterSource.GetInstantData(id, out var data) || !data.IsElevationDataReady || data.ElevationValues == null)
                 return null;
